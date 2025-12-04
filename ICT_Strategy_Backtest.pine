@@ -1,0 +1,595 @@
+//@version=6
+strategy("ICT Multi-Module Strategy [BACKTEST]", overlay=true, 
+         initial_capital=10000, 
+         default_qty_type=strategy.percent_of_equity, 
+         default_qty_value=100,
+         commission_type=strategy.commission.percent, 
+         commission_value=0.1,
+         slippage=2,
+         max_boxes_count=500, 
+         max_lines_count=500)
+
+// ============================================================================
+// BACKTEST SETTINGS
+// ============================================================================
+i_start_date = input.time(timestamp("2020-01-01 00:00"), "Start Date", group="Backtest")
+i_end_date = input.time(timestamp("2099-12-31 23:59"), "End Date", group="Backtest")
+i_trade_direction = input.string("Both", "Trade Direction", options=["Long", "Short", "Both"], group="Backtest")
+
+// Date filter
+in_date_range = true
+
+// ============================================================================
+// GLOBAL SETTINGS
+// ============================================================================
+i_show_ob = input.bool(true, "Show Order Blocks", group="Global Settings")
+i_show_fvg = input.bool(true, "Show Fair Value Gaps", group="Global Settings")
+i_show_bos = input.bool(true, "Show Break of Structure", group="Global Settings")
+i_show_liquidity = input.bool(true, "Show Liquidity Pools", group="Global Settings")
+i_show_po3 = input.bool(true, "Show Po3 Phases", group="Global Settings")
+i_show_confluence = input.bool(true, "Show Confluence Signals", group="Global Settings")
+
+// Max Zones Limiter
+i_max_ob_zones = input.int(5, "Max OB Zones", minval=1, maxval=20, group="Visual Limits")
+i_max_fvg_zones = input.int(3, "Max FVG Zones", minval=1, maxval=20, group="Visual Limits")
+i_max_liq_zones = input.int(5, "Max Liquidity Zones", minval=1, maxval=20, group="Visual Limits")
+
+// ============================================================================
+// MODULE 1: ORDER BLOCK DETECTOR
+// ============================================================================
+i_ob_lookback = input.int(10, "Lookback Period", minval=1, group="Order Block")
+i_ob_wick_threshold = input.float(0.3, "Wick Threshold Ratio", minval=0.0, maxval=1.0, group="Order Block")
+i_ob_zone_extension = input.int(20, "Zone Extension (Candles)", minval=1, group="Order Block")
+
+type OrderBlock
+    float top
+    float bottom
+    int strength
+    bool is_bullish
+    int bar_index
+    box box_id
+
+var array<OrderBlock> active_obs = array.new<OrderBlock>()
+
+f_ob_strength(float body_size, float wick_ratio, float volume_ratio) =>
+    score = 0
+    if body_size > ta.atr(14) * 0.5
+        score += 1
+    if wick_ratio < i_ob_wick_threshold
+        score += 1
+    if volume_ratio > 1.2
+        score += 1
+    score
+
+f_detect_bullish_ob() =>
+    is_ob = false
+    ob_top = 0.0
+    ob_bottom = 0.0
+    strength = 0
+    
+    volume_sma = ta.sma(volume, 20)
+    
+    if close > open and close[0] > open[1] and open[0] < close[1]
+        if close[1] < open[1]
+            body_size = open[1] - close[1]
+            lower_wick = close[1] - low[1]
+            wick_ratio = lower_wick / body_size
+            volume_ratio = volume[1] / volume_sma
+            
+            if wick_ratio <= i_ob_wick_threshold
+                is_ob := true
+                ob_top := open[1]
+                ob_bottom := close[1]
+                strength := f_ob_strength(body_size, wick_ratio, volume_ratio)
+    
+    [is_ob, ob_top, ob_bottom, strength]
+
+f_detect_bearish_ob() =>
+    is_ob = false
+    ob_top = 0.0
+    ob_bottom = 0.0
+    strength = 0
+    
+    volume_sma = ta.sma(volume, 20)
+    
+    if close < open and close[0] < open[1] and open[0] > close[1]
+        if close[1] > open[1]
+            body_size = close[1] - open[1]
+            upper_wick = high[1] - close[1]
+            wick_ratio = upper_wick / body_size
+            volume_ratio = volume[1] / volume_sma
+            
+            if wick_ratio <= i_ob_wick_threshold
+                is_ob := true
+                ob_top := close[1]
+                ob_bottom := open[1]
+                strength := f_ob_strength(body_size, wick_ratio, volume_ratio)
+    
+    [is_ob, ob_top, ob_bottom, strength]
+
+if i_show_ob
+    [is_bullish_ob, bull_top, bull_bottom, bull_strength] = f_detect_bullish_ob()
+    if is_bullish_ob
+        if array.size(active_obs) >= i_max_ob_zones
+            oldest_ob = array.shift(active_obs)
+            box.delete(oldest_ob.box_id)
+        
+        ob_color = bull_strength == 3 ? color.new(color.green, 80) : bull_strength == 2 ? color.new(color.green, 85) : color.new(color.green, 90)
+        box_id = box.new(bar_index[1], bull_top, bar_index + i_ob_zone_extension, bull_bottom, 
+                         border_color=color.green, bgcolor=ob_color, 
+                         text="OB+" + str.tostring(bull_strength), text_size=size.small)
+        array.push(active_obs, OrderBlock.new(bull_top, bull_bottom, bull_strength, true, bar_index[1], box_id))
+    
+    [is_bearish_ob, bear_top, bear_bottom, bear_strength] = f_detect_bearish_ob()
+    if is_bearish_ob
+        if array.size(active_obs) >= i_max_ob_zones
+            oldest_ob = array.shift(active_obs)
+            box.delete(oldest_ob.box_id)
+        
+        ob_color = bear_strength == 3 ? color.new(color.red, 80) : bear_strength == 2 ? color.new(color.red, 85) : color.new(color.red, 90)
+        box_id = box.new(bar_index[1], bear_top, bar_index + i_ob_zone_extension, bear_bottom, 
+                         border_color=color.red, bgcolor=ob_color, 
+                         text="OB-" + str.tostring(bear_strength), text_size=size.small)
+        array.push(active_obs, OrderBlock.new(bear_top, bear_bottom, bear_strength, false, bar_index[1], box_id))
+    
+    if array.size(active_obs) > 0
+        for i = array.size(active_obs) - 1 to 0
+            ob = array.get(active_obs, i)
+            is_broken = ob.is_bullish ? low < ob.bottom : high > ob.top
+            if is_broken
+                box.delete(ob.box_id)
+                array.remove(active_obs, i)
+
+// ============================================================================
+// MODULE 2: FAIR VALUE GAP FINDER
+// ============================================================================
+i_fvg_min_size = input.float(0.0, "Minimum Gap Size (% ATR)", minval=0.0, group="Fair Value Gap")
+i_fvg_zone_extension = input.int(30, "Zone Extension (Candles)", minval=1, group="Fair Value Gap")
+
+type FairValueGap
+    float top
+    float bottom
+    bool is_bullish
+    int bar_index
+    box box_id
+    bool alerted
+
+var array<FairValueGap> active_fvgs = array.new<FairValueGap>()
+
+f_detect_bullish_fvg() =>
+    is_fvg = false
+    fvg_top = 0.0
+    fvg_bottom = 0.0
+    
+    atr_value = ta.atr(14)
+    
+    gap_bottom = high[2]
+    gap_top = low[0]
+    
+    if gap_top > gap_bottom
+        gap_size = gap_top - gap_bottom
+        
+        if gap_size >= atr_value * i_fvg_min_size
+            is_fvg := true
+            fvg_top := gap_top
+            fvg_bottom := gap_bottom
+    
+    [is_fvg, fvg_top, fvg_bottom]
+
+f_detect_bearish_fvg() =>
+    is_fvg = false
+    fvg_top = 0.0
+    fvg_bottom = 0.0
+    
+    atr_value = ta.atr(14)
+    
+    gap_top = low[2]
+    gap_bottom = high[0]
+    
+    if gap_top > gap_bottom
+        gap_size = gap_top - gap_bottom
+        
+        if gap_size >= atr_value * i_fvg_min_size
+            is_fvg := true
+            fvg_top := gap_top
+            fvg_bottom := gap_bottom
+    
+    [is_fvg, fvg_top, fvg_bottom]
+
+if i_show_fvg
+    [is_bull_fvg, bull_fvg_top, bull_fvg_bottom] = f_detect_bullish_fvg()
+    if is_bull_fvg
+        if array.size(active_fvgs) >= i_max_fvg_zones
+            oldest_fvg = array.shift(active_fvgs)
+            box.delete(oldest_fvg.box_id)
+        
+        fvg_color = color.new(color.green, 85)
+        box_id = box.new(bar_index[1], bull_fvg_top, bar_index + i_fvg_zone_extension, bull_fvg_bottom,
+                         border_color=color.green, bgcolor=fvg_color, border_style=line.style_dashed,
+                         text="FVG↑", text_size=size.small)
+        array.push(active_fvgs, FairValueGap.new(bull_fvg_top, bull_fvg_bottom, true, bar_index[1], box_id, false))
+    
+    [is_bear_fvg, bear_fvg_top, bear_fvg_bottom] = f_detect_bearish_fvg()
+    if is_bear_fvg
+        if array.size(active_fvgs) >= i_max_fvg_zones
+            oldest_fvg = array.shift(active_fvgs)
+            box.delete(oldest_fvg.box_id)
+        
+        fvg_color = color.new(color.red, 85)
+        box_id = box.new(bar_index[1], bear_fvg_top, bar_index + i_fvg_zone_extension, bear_fvg_bottom,
+                         border_color=color.red, bgcolor=fvg_color, border_style=line.style_dashed,
+                         text="FVG↓", text_size=size.small)
+        array.push(active_fvgs, FairValueGap.new(bear_fvg_top, bear_fvg_bottom, false, bar_index[1], box_id, false))
+    
+    if array.size(active_fvgs) > 0
+        for i = array.size(active_fvgs) - 1 to 0
+            fvg = array.get(active_fvgs, i)
+            is_filled = fvg.is_bullish ? close < fvg.bottom : close > fvg.top
+            if is_filled
+                box.delete(fvg.box_id)
+                array.remove(active_fvgs, i)
+
+// ============================================================================
+// MODULE 3: BREAK OF STRUCTURE
+// ============================================================================
+i_bos_lookback = input.int(10, "Swing Lookback", minval=5, group="Break of Structure")
+i_bos_min_move = input.float(0.5, "Minimum Move (%)", minval=0.1, group="Break of Structure")
+i_bos_volume_filter = input.bool(true, "Enable Volume Filter", group="Break of Structure")
+i_bos_volume_threshold = input.float(1.2, "Volume Threshold (vs MA)", minval=1.0, group="Break of Structure")
+
+var string current_trend = "neutral"
+
+f_swing_high(int lookback) =>
+    highest = high[lookback]
+    is_swing = true
+    for i = 0 to lookback - 1
+        if high[i] > highest
+            is_swing := false
+            break
+    for i = lookback + 1 to lookback * 2
+        if high[i] > highest
+            is_swing := false
+            break
+    is_swing ? highest : na
+
+f_swing_low(int lookback) =>
+    lowest = low[lookback]
+    is_swing = true
+    for i = 0 to lookback - 1
+        if low[i] < lowest
+            is_swing := false
+            break
+    for i = lookback + 1 to lookback * 2
+        if low[i] < lowest
+            is_swing := false
+            break
+    is_swing ? lowest : na
+
+if i_show_bos
+    swing_high = f_swing_high(i_bos_lookback)
+    swing_low = f_swing_low(i_bos_lookback)
+    volume_sma = ta.sma(volume, 20)
+    
+    if not na(swing_high) and close > swing_high
+        move_pct = ((close - swing_high) / swing_high) * 100
+        volume_ok = not i_bos_volume_filter or volume > volume_sma * i_bos_volume_threshold
+        
+        if move_pct >= i_bos_min_move and volume_ok
+            line.new(bar_index[i_bos_lookback], swing_high, bar_index, swing_high,
+                    color=color.green, width=2, style=line.style_solid)
+            label.new(bar_index, swing_high, "BOS↑", color=color.green, textcolor=color.white, 
+                     style=label.style_label_up, size=size.small)
+            current_trend := "bullish"
+    
+    if not na(swing_low) and close < swing_low
+        move_pct = ((swing_low - close) / swing_low) * 100
+        volume_ok = not i_bos_volume_filter or volume > volume_sma * i_bos_volume_threshold
+        
+        if move_pct >= i_bos_min_move and volume_ok
+            line.new(bar_index[i_bos_lookback], swing_low, bar_index, swing_low,
+                    color=color.red, width=2, style=line.style_solid)
+            label.new(bar_index, swing_low, "BOS↓", color=color.red, textcolor=color.white, 
+                     style=label.style_label_down, size=size.small)
+            current_trend := "bearish"
+
+// ============================================================================
+// MODULE 4: LIQUIDITY POOL LOCATOR
+// ============================================================================
+i_liq_lookback = input.int(20, "Liquidity Lookback", minval=5, group="Liquidity")
+i_liq_min_swing = input.float(0.3, "Minimum Swing Size (% ATR)", minval=0.1, group="Liquidity")
+
+type LiquidityPool
+    float level
+    bool is_high
+    int bar_index
+    line line_id
+
+var array<LiquidityPool> liquidity_pools = array.new<LiquidityPool>()
+
+f_liquidity_high() =>
+    pivot_high = ta.pivothigh(high, i_liq_lookback, i_liq_lookback)
+    is_significant = false
+    atr_value = ta.atr(14)
+    
+    if not na(pivot_high)
+        swing_size = pivot_high - ta.lowest(low, i_liq_lookback * 2)
+        if swing_size >= atr_value * i_liq_min_swing
+            is_significant := true
+    
+    [is_significant, pivot_high]
+
+f_liquidity_low() =>
+    pivot_low = ta.pivotlow(low, i_liq_lookback, i_liq_lookback)
+    is_significant = false
+    atr_value = ta.atr(14)
+    
+    if not na(pivot_low)
+        swing_size = ta.highest(high, i_liq_lookback * 2) - pivot_low
+        if swing_size >= atr_value * i_liq_min_swing
+            is_significant := true
+    
+    [is_significant, pivot_low]
+
+if i_show_liquidity
+    [is_sig_high, liq_high] = f_liquidity_high()
+    if is_sig_high
+        if array.size(liquidity_pools) >= i_max_liq_zones
+            oldest_liq = array.shift(liquidity_pools)
+            line.delete(oldest_liq.line_id)
+        
+        line_id = line.new(bar_index[i_liq_lookback], liq_high, bar_index + 10, liq_high,
+                          color=color.yellow, width=1, style=line.style_dotted)
+        label.new(bar_index[i_liq_lookback], liq_high, "LIQ", color=color.yellow, 
+                 textcolor=color.black, style=label.style_label_down, size=size.tiny)
+        array.push(liquidity_pools, LiquidityPool.new(liq_high, true, bar_index[i_liq_lookback], line_id))
+    
+    [is_sig_low, liq_low] = f_liquidity_low()
+    if is_sig_low
+        if array.size(liquidity_pools) >= i_max_liq_zones
+            oldest_liq = array.shift(liquidity_pools)
+            line.delete(oldest_liq.line_id)
+        
+        line_id = line.new(bar_index[i_liq_lookback], liq_low, bar_index + 10, liq_low,
+                          color=color.yellow, width=1, style=line.style_dotted)
+        label.new(bar_index[i_liq_lookback], liq_low, "LIQ", color=color.yellow, 
+                 textcolor=color.black, style=label.style_label_up, size=size.tiny)
+        array.push(liquidity_pools, LiquidityPool.new(liq_low, false, bar_index[i_liq_lookback], line_id))
+    
+    if array.size(liquidity_pools) > 0
+        for i = array.size(liquidity_pools) - 1 to 0
+            liq = array.get(liquidity_pools, i)
+            is_swept = liq.is_high ? high > liq.level : low < liq.level
+            
+            if is_swept
+                line.delete(liq.line_id)
+                array.remove(liquidity_pools, i)
+
+// ============================================================================
+// MODULE 5: PO3 / FRACTAL MOMENTUM
+// ============================================================================
+i_po3_enabled = input.bool(true, "Enable Po3 Detection", group="Po3")
+i_po3_fractal_depth = input.int(5, "Fractal Depth", minval=3, group="Po3")
+i_po3_expansion_mult = input.float(1.5, "Expansion Multiplier", minval=1.0, group="Po3")
+i_po3_manipulation_threshold = input.float(0.3, "Manipulation Threshold (% ATR)", minval=0.1, group="Po3")
+
+type Po3Phase
+    string phase
+    float acc_high
+    float acc_low
+    float manip_level
+    float expansion_target
+    int start_bar
+
+var Po3Phase current_po3 = Po3Phase.new("accumulation", 0.0, 0.0, 0.0, 0.0, 0)
+var bool po3_active = false
+
+f_detect_accumulation() =>
+    range_high = ta.highest(high, i_po3_fractal_depth * 2)
+    range_low = ta.lowest(low, i_po3_fractal_depth * 2)
+    range_size = range_high - range_low
+    atr_value = ta.atr(14)
+    
+    is_accumulation = range_size < atr_value * 0.5
+    [is_accumulation, range_high, range_low]
+
+f_detect_manipulation(float acc_high, float acc_low) =>
+    is_manip = false
+    manip_level = 0.0
+    is_bullish = false
+    
+    atr_value = ta.atr(14)
+    
+    if low < acc_low - (atr_value * i_po3_manipulation_threshold)
+        is_manip := true
+        manip_level := low
+        is_bullish := true
+    
+    if high > acc_high + (atr_value * i_po3_manipulation_threshold)
+        is_manip := true
+        manip_level := high
+        is_bullish := false
+    
+    [is_manip, manip_level, is_bullish]
+
+if i_show_po3 and i_po3_enabled
+    [is_acc, acc_high, acc_low] = f_detect_accumulation()
+    
+    if is_acc and current_po3.phase == "accumulation"
+        current_po3.acc_high := acc_high
+        current_po3.acc_low := acc_low
+        current_po3.start_bar := bar_index
+    
+    [is_manip, manip_level, is_bull_manip] = f_detect_manipulation(current_po3.acc_high, current_po3.acc_low)
+    
+    if is_manip and current_po3.phase == "accumulation"
+        current_po3.phase := "manipulation"
+        current_po3.manip_level := manip_level
+        
+        acc_range = current_po3.acc_high - current_po3.acc_low
+        if is_bull_manip
+            current_po3.expansion_target := current_po3.acc_high + (acc_range * i_po3_expansion_mult)
+            label.new(bar_index, low, "Po3 MANIP↓→↑", color=color.blue, textcolor=color.white, 
+                     style=label.style_label_up, size=size.small)
+        else
+            current_po3.expansion_target := current_po3.acc_low - (acc_range * i_po3_expansion_mult)
+            label.new(bar_index, high, "Po3 MANIP↑→↓", color=color.blue, textcolor=color.white, 
+                     style=label.style_label_down, size=size.small)
+        
+        po3_active := true
+    
+    if po3_active and current_po3.phase == "manipulation"
+        line.new(bar_index - 1, current_po3.expansion_target, bar_index, current_po3.expansion_target, color=color.blue, width=2, style=line.style_dashed)
+
+// ============================================================================
+// MODULE 6: MULTI-TF CONFLUENCE ENGINE
+// ============================================================================
+i_conf_enabled = input.bool(true, "Enable Confluence Engine", group="Confluence")
+i_conf_threshold = input.int(70, "Signal Threshold", minval=0, maxval=100, group="Confluence")
+i_conf_ob_weight = input.float(25.0, "OB Weight (%)", minval=0, maxval=100, group="Confluence")
+i_conf_fvg_weight = input.float(20.0, "FVG Weight (%)", minval=0, maxval=100, group="Confluence")
+i_conf_bos_weight = input.float(15.0, "BOS Weight (%)", minval=0, maxval=100, group="Confluence")
+i_conf_liq_weight = input.float(30.0, "Liquidity Weight (%)", minval=0, maxval=100, group="Confluence")
+i_conf_po3_weight = input.float(10.0, "Po3 Weight (%)", minval=0, maxval=100, group="Confluence")
+
+f_calculate_confluence() =>
+    bullish_score = 0.0
+    bearish_score = 0.0
+    
+    ob_bull = 0.0
+    ob_bear = 0.0
+    if array.size(active_obs) > 0
+        for i = 0 to array.size(active_obs) - 1
+            ob = array.get(active_obs, i)
+            if close >= ob.bottom and close <= ob.top
+                strength_mult = ob.strength / 3.0
+                if ob.is_bullish
+                    ob_bull := math.max(ob_bull, strength_mult)
+                else
+                    ob_bear := math.max(ob_bear, strength_mult)
+    
+    bullish_score += ob_bull * i_conf_ob_weight
+    bearish_score += ob_bear * i_conf_ob_weight
+    
+    fvg_bull = 0.0
+    fvg_bear = 0.0
+    if array.size(active_fvgs) > 0
+        for i = 0 to array.size(active_fvgs) - 1
+            fvg = array.get(active_fvgs, i)
+            if close >= fvg.bottom and close <= fvg.top
+                if fvg.is_bullish
+                    fvg_bull := 1.0
+                else
+                    fvg_bear := 1.0
+    
+    bullish_score += fvg_bull * i_conf_fvg_weight
+    bearish_score += fvg_bear * i_conf_fvg_weight
+    
+    bos_score = current_trend == "bullish" ? i_conf_bos_weight : current_trend == "bearish" ? i_conf_bos_weight : 0.0
+    
+    if current_trend == "bullish"
+        bullish_score += bos_score
+    else if current_trend == "bearish"
+        bearish_score += bos_score
+    
+    liq_bull = 0.0
+    liq_bear = 0.0
+    if array.size(liquidity_pools) > 0
+        for i = 0 to array.size(liquidity_pools) - 1
+            liq = array.get(liquidity_pools, i)
+            distance = math.abs(close - liq.level)
+            if distance < ta.atr(14) * 0.5
+                if liq.is_high
+                    liq_bear := 1.0
+                else
+                    liq_bull := 1.0
+    
+    bullish_score += liq_bull * i_conf_liq_weight
+    bearish_score += liq_bear * i_conf_liq_weight
+    
+    if po3_active
+        po3_signal = current_po3.expansion_target > close ? 1.0 : -1.0
+        if po3_signal > 0
+            bullish_score += i_conf_po3_weight
+        else
+            bearish_score += i_conf_po3_weight
+    
+    net_score = bullish_score - bearish_score
+    confidence = math.max(bullish_score, bearish_score)
+    direction = net_score > 0 ? "long" : net_score < 0 ? "short" : "neutral"
+    
+    [confidence, direction, bullish_score, bearish_score]
+
+var label conf_label = na
+if i_show_confluence and i_conf_enabled
+    [conf_score, conf_direction, bull_score, bear_score] = f_calculate_confluence()
+    
+    if not na(conf_label)
+        label.delete(conf_label)
+    
+    if conf_score >= i_conf_threshold
+        label_color = conf_direction == "long" ? color.green : conf_direction == "short" ? color.red : color.gray
+        label_text = conf_direction + " " + str.tostring(conf_score, "#") + "%"
+        
+        conf_label := label.new(bar_index, high, label_text, color=label_color, 
+                                textcolor=color.white, style=label.style_label_down, size=size.normal)
+
+// ============================================================================
+// MODULE 7: RISK MANAGER & STRATEGY EXECUTION
+// ============================================================================
+i_risk_per_trade = input.float(1.0, "Risk Per Trade (%)", minval=0.1, maxval=10.0, group="Risk Management")
+i_risk_atr_mult_stop = input.float(1.5, "ATR Multiplier (Stop)", minval=0.5, group="Risk Management")
+i_risk_atr_mult_target = input.float(3.0, "ATR Multiplier (Target)", minval=1.0, group="Risk Management")
+
+f_calculate_stops_targets() =>
+    atr_value = ta.atr(14)
+    
+    stop_loss_long = close - (atr_value * i_risk_atr_mult_stop)
+    stop_loss_short = close + (atr_value * i_risk_atr_mult_stop)
+    
+    target_long = close + (atr_value * i_risk_atr_mult_target)
+    target_short = close - (atr_value * i_risk_atr_mult_target)
+    
+    [stop_loss_long, stop_loss_short, target_long, target_short]
+
+// Strategy Logic
+[conf_score, conf_direction, bull_score, bear_score] = f_calculate_confluence()
+[sl_long, sl_short, tp_long, tp_short] = f_calculate_stops_targets()
+
+// Entry Conditions
+long_condition = conf_score >= i_conf_threshold and conf_direction == "long" and in_date_range and (i_trade_direction == "Long" or i_trade_direction == "Both")
+short_condition = conf_score >= i_conf_threshold and conf_direction == "short" and in_date_range and (i_trade_direction == "Short" or i_trade_direction == "Both")
+
+// Execute Trades
+if long_condition and strategy.position_size == 0
+    strategy.entry("Long", strategy.long)
+    strategy.exit("Long Exit", "Long", stop=sl_long, limit=tp_long)
+
+if short_condition and strategy.position_size == 0
+    strategy.entry("Short", strategy.short)
+    strategy.exit("Short Exit", "Short", stop=sl_short, limit=tp_short)
+
+// Visual markers for entries
+plotshape(long_condition, "Long Signal", shape.triangleup, location.belowbar, color.green, size=size.small)
+plotshape(short_condition, "Short Signal", shape.triangledown, location.abovebar, color.red, size=size.small)
+
+// Plot equity curve
+plot(strategy.equity, "Equity", color=color.blue, linewidth=2, display=display.none)
+
+// ============================================================================
+// PERFORMANCE METRICS (displayed in Data Window)
+// ============================================================================
+// Calculate additional metrics
+total_trades = strategy.closedtrades
+win_rate = strategy.wintrades / total_trades * 100
+profit_factor = strategy.grossprofit / strategy.grossloss
+avg_win = strategy.grossprofit / strategy.wintrades
+avg_loss = strategy.grossloss / strategy.losstrades
+rr_ratio = avg_win / avg_loss
+expectancy = (win_rate / 100 * avg_win) - ((1 - win_rate / 100) * avg_loss)
+
+// Display key metrics (visible in Data Window)
+plot(total_trades, "Total Trades", display=display.data_window)
+plot(win_rate, "Win Rate %", display=display.data_window)
+plot(profit_factor, "Profit Factor", display=display.data_window)
+plot(rr_ratio, "RR Ratio", display=display.data_window)
+plot(expectancy, "Expectancy", display=display.data_window)
