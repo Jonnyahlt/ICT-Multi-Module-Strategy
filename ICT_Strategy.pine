@@ -123,8 +123,8 @@ if i_show_ob
             box.delete(oldest_ob.box_id)
         
         ob_color = bull_strength == 3 ? color.new(color.green, 80) : bull_strength == 2 ? color.new(color.green, 85) : color.new(color.green, 90)
-        box_id = box.new(bar_index - 1, bull_top, bar_index + i_ob_zone_extension, bull_bottom, 
-                         border_color=color.green, bgcolor=ob_color, 
+        box_id = box.new(time[1], bull_top, time, bull_bottom, xloc=xloc.bar_time, 
+                         border_color=color.green, bgcolor=ob_color, extend=extend.right, 
                          text="OB+" + str.tostring(bull_strength), text_size=size.small)
         array.push(active_obs, OrderBlock.new(bull_top, bull_bottom, bull_strength, true, bar_index - 1, box_id))
     
@@ -137,8 +137,8 @@ if i_show_ob
             box.delete(oldest_ob.box_id)
         
         ob_color = bear_strength == 3 ? color.new(color.red, 80) : bear_strength == 2 ? color.new(color.red, 85) : color.new(color.red, 90)
-        box_id = box.new(bar_index - 1, bear_top, bar_index + i_ob_zone_extension, bear_bottom, 
-                         border_color=color.red, bgcolor=ob_color, 
+        box_id = box.new(time[1], bear_top, time, bear_bottom, xloc=xloc.bar_time, 
+                         border_color=color.red, bgcolor=ob_color, extend=extend.right, 
                          text="OB-" + str.tostring(bear_strength), text_size=size.small)
         array.push(active_obs, OrderBlock.new(bear_top, bear_bottom, bear_strength, false, bar_index - 1, box_id))
     
@@ -146,9 +146,6 @@ if i_show_ob
     if array.size(active_obs) > 0
         for i = array.size(active_obs) - 1 to 0
             ob = array.get(active_obs, i)
-            
-            // Update box right position dynamically
-            box.set_right(ob.box_id, bar_index + i_ob_zone_extension)
             
             // Alert on OB touch
             is_touching = (low <= ob.top and high >= ob.bottom)
@@ -196,13 +193,17 @@ f_detect_bullish_fvg() =>
     
     atr_value = ta.atr(14)
     
-    // Gap between candle[2] high and candle[0] low, with candle[1] in between
-    gap_bottom = high[2]
-    gap_top = low[0]
+    // Bullish FVG: 3-candle pattern moving UP
+    // Gap between high of candle[2] and low of candle[0]
+    // Candle[1] should NOT fill this gap (leave FVG zone)
+    gap_bottom = high[2]  // Top of first (old) candle
+    gap_top = low[0]       // Bottom of third (current) candle
     
+    // Check if there's actually a gap (no overlap)
     if gap_top > gap_bottom
         gap_size = gap_top - gap_bottom
         
+        // Verify gap size meets minimum threshold
         if gap_size >= atr_value * i_fvg_min_size
             is_fvg := true
             fvg_top := gap_top
@@ -218,13 +219,17 @@ f_detect_bearish_fvg() =>
     
     atr_value = ta.atr(14)
     
-    // Gap between candle[2] low and candle[0] high, with candle[1] in between
-    gap_top = low[2]
-    gap_bottom = high[0]
+    // Bearish FVG: 3-candle pattern moving DOWN
+    // Gap between low of candle[2] and high of candle[0]
+    // Candle[1] should NOT fill this gap (leave FVG zone)
+    gap_top = low[2]       // Bottom of first (old) candle
+    gap_bottom = high[0]   // Top of third (current) candle
     
+    // Check if there's actually a gap (no overlap)
     if gap_top > gap_bottom
         gap_size = gap_top - gap_bottom
         
+        // Verify gap size meets minimum threshold
         if gap_size >= atr_value * i_fvg_min_size
             is_fvg := true
             fvg_top := gap_top
@@ -243,8 +248,8 @@ if i_show_fvg
             box.delete(oldest_fvg.box_id)
         
         fvg_color = color.new(color.green, 85)
-        box_id = box.new(bar_index - 1, bull_fvg_top, bar_index + i_fvg_zone_extension, bull_fvg_bottom,
-                         border_color=color.green, bgcolor=fvg_color, border_style=line.style_dashed,
+        box_id = box.new(time[1], bull_fvg_top, time, bull_fvg_bottom, xloc=xloc.bar_time,
+                         border_color=color.green, bgcolor=fvg_color, border_style=line.style_dashed, extend=extend.right,
                          text="FVG↑", text_size=size.small)
         array.push(active_fvgs, FairValueGap.new(bull_fvg_top, bull_fvg_bottom, true, bar_index - 1, box_id, false))
     
@@ -257,8 +262,8 @@ if i_show_fvg
             box.delete(oldest_fvg.box_id)
         
         fvg_color = color.new(color.red, 85)
-        box_id = box.new(bar_index - 1, bear_fvg_top, bar_index + i_fvg_zone_extension, bear_fvg_bottom,
-                         border_color=color.red, bgcolor=fvg_color, border_style=line.style_dashed,
+        box_id = box.new(time[1], bear_fvg_top, time, bear_fvg_bottom, xloc=xloc.bar_time,
+                         border_color=color.red, bgcolor=fvg_color, border_style=line.style_dashed, extend=extend.right,
                          text="FVG↓", text_size=size.small)
         array.push(active_fvgs, FairValueGap.new(bear_fvg_top, bear_fvg_bottom, false, bar_index - 1, box_id, false))
     
@@ -266,9 +271,6 @@ if i_show_fvg
     if array.size(active_fvgs) > 0
         for i = array.size(active_fvgs) - 1 to 0
             fvg = array.get(active_fvgs, i)
-            
-            // Update box right position dynamically
-            box.set_right(fvg.box_id, bar_index + i_fvg_zone_extension)
             
             // Check if FVG is tested for first time (alert)
             is_tested = fvg.is_bullish ? (low <= fvg.top and high >= fvg.bottom) : (high >= fvg.bottom and low <= fvg.top)
@@ -347,9 +349,9 @@ if i_show_bos
         volume_ok = not i_bos_volume_filter or volume > volume_sma * i_bos_volume_threshold
         
         if move_pct >= i_bos_min_move and volume_ok
-            line_id = line.new(bar_index - i_bos_lookback, swing_high, bar_index, swing_high,
+            line_id = line.new(time[i_bos_lookback], swing_high, time, swing_high, xloc=xloc.bar_time,
                               color=color.green, width=2, style=line.style_solid)
-            label.new(bar_index, swing_high, "BOS↑", color=color.green, textcolor=color.white, 
+            label.new(time, swing_high, "BOS↑", xloc=xloc.bar_time, color=color.green, textcolor=color.white, 
                      style=label.style_label_up, size=size.small)
             current_trend := "bullish"
             array.push(structure_breaks, StructureBreak.new(swing_high, true, bar_index, line_id))
@@ -360,9 +362,9 @@ if i_show_bos
         volume_ok = not i_bos_volume_filter or volume > volume_sma * i_bos_volume_threshold
         
         if move_pct >= i_bos_min_move and volume_ok
-            line_id = line.new(bar_index - i_bos_lookback, swing_low, bar_index, swing_low,
+            line_id = line.new(time[i_bos_lookback], swing_low, time, swing_low, xloc=xloc.bar_time,
                               color=color.red, width=2, style=line.style_solid)
-            label.new(bar_index, swing_low, "BOS↓", color=color.red, textcolor=color.white, 
+            label.new(time, swing_low, "BOS↓", xloc=xloc.bar_time, color=color.red, textcolor=color.white, 
                      style=label.style_label_down, size=size.small)
             current_trend := "bearish"
             array.push(structure_breaks, StructureBreak.new(swing_low, false, bar_index, line_id))
@@ -426,9 +428,9 @@ if i_show_liquidity
             oldest_liq = array.shift(liquidity_pools)
             line.delete(oldest_liq.line_id)
         
-        line_id = line.new(bar_index - i_liq_lookback, liq_high, bar_index + 10, liq_high,
-                          color=color.yellow, width=1, style=line.style_dotted)
-        label.new(bar_index - i_liq_lookback, liq_high, "LIQ", color=color.yellow, 
+        line_id = line.new(time[i_liq_lookback], liq_high, time, liq_high, xloc=xloc.bar_time,
+                          color=color.yellow, width=1, style=line.style_dotted, extend=extend.right)
+        label.new(time[i_liq_lookback], liq_high, "LIQ", xloc=xloc.bar_time, color=color.yellow, 
                  textcolor=color.black, style=label.style_label_down, size=size.tiny)
         array.push(liquidity_pools, LiquidityPool.new(liq_high, true, bar_index - i_liq_lookback, line_id))
     
@@ -439,9 +441,9 @@ if i_show_liquidity
             oldest_liq = array.shift(liquidity_pools)
             line.delete(oldest_liq.line_id)
         
-        line_id = line.new(bar_index - i_liq_lookback, liq_low, bar_index + 10, liq_low,
-                          color=color.yellow, width=1, style=line.style_dotted)
-        label.new(bar_index - i_liq_lookback, liq_low, "LIQ", color=color.yellow, 
+        line_id = line.new(time[i_liq_lookback], liq_low, time, liq_low, xloc=xloc.bar_time,
+                          color=color.yellow, width=1, style=line.style_dotted, extend=extend.right)
+        label.new(time[i_liq_lookback], liq_low, "LIQ", xloc=xloc.bar_time, color=color.yellow, 
                  textcolor=color.black, style=label.style_label_up, size=size.tiny)
         array.push(liquidity_pools, LiquidityPool.new(liq_low, false, bar_index - i_liq_lookback, line_id))
     
@@ -449,9 +451,6 @@ if i_show_liquidity
     if array.size(liquidity_pools) > 0
         for i = array.size(liquidity_pools) - 1 to 0
             liq = array.get(liquidity_pools, i)
-            
-            // Update line right position dynamically
-            line.set_x2(liq.line_id, bar_index + 10)
             
             is_swept = liq.is_high ? high > liq.level : low < liq.level
             
@@ -540,21 +539,16 @@ if i_show_po3 and i_po3_enabled
         acc_range = current_po3.acc_high - current_po3.acc_low
         if is_bull_manip
             current_po3.expansion_target := current_po3.acc_high + (acc_range * i_po3_expansion_mult)
-            label.new(bar_index, low, "Po3 MANIP↓→↑", color=color.blue, textcolor=color.white, 
-                     style=label.style_label_up, size=size.small)
+            label.new(time, low, "Po3 MANIP↓→↑", xloc=xloc.bar_time, color=color.blue, textcolor=color.white, style=label.style_label_up, size=size.small)
         else
             current_po3.expansion_target := current_po3.acc_low - (acc_range * i_po3_expansion_mult)
-            label.new(bar_index, high, "Po3 MANIP↑→↓", color=color.blue, textcolor=color.white, 
+            label.new(time, high, "Po3 MANIP↑→↓", xloc=xloc.bar_time, color=color.blue, textcolor=color.white, 
                      style=label.style_label_down, size=size.small)
         
         // Create new expansion target line
-        current_po3.target_line := line.new(bar_index, current_po3.expansion_target, bar_index + 20, current_po3.expansion_target, 
-                                            color=color.blue, width=2, style=line.style_dashed)
+        current_po3.target_line := line.new(time, current_po3.expansion_target, time, current_po3.expansion_target, xloc=xloc.bar_time, 
+                                            color=color.blue, width=2, style=line.style_dashed, extend=extend.right)
         po3_active := true
-    
-    // Extend the target line each bar
-    if po3_active and current_po3.phase == "manipulation" and not na(current_po3.target_line)
-        line.set_x2(current_po3.target_line, bar_index + 20)
 
 // ============================================================================
 // MODULE 6: MULTI-TF CONFLUENCE ENGINE
@@ -661,7 +655,7 @@ if i_show_confluence and i_conf_enabled
         label_color = conf_direction == "long" ? color.green : conf_direction == "short" ? color.red : color.gray
         label_text = conf_direction + " " + str.tostring(conf_score, "#") + "%"
         
-        conf_label := label.new(bar_index, high + ta.atr(14) * 0.5, label_text, color=label_color, textcolor=color.white, style=label.style_label_down, size=size.normal)
+        conf_label := label.new(time, high + ta.atr(14) * 0.5, label_text, xloc=xloc.bar_time, color=label_color, textcolor=color.white, style=label.style_label_down, size=size.normal)
         
         // Alert on high confidence signals
         if conf_score >= i_conf_threshold and (conf_direction == "long" or conf_direction == "short") and i_alert_confluence
@@ -709,22 +703,22 @@ if i_risk_enabled
             stop_distance = close - sl_long
             pos_size = f_calculate_position_size(stop_distance, i_risk_account_size, i_risk_per_trade)
             
-            line.new(bar_index, sl_long, bar_index + 5, sl_long, color=color.red, width=2)
-            line.new(bar_index, tp_long, bar_index + 5, tp_long, color=color.green, width=2)
-            label.new(bar_index, sl_long, "SL", color=color.red, textcolor=color.white, 
+            line.new(time, sl_long, time, sl_long, xloc=xloc.bar_time, color=color.red, width=2, extend=extend.right)
+            line.new(time, tp_long, time, tp_long, xloc=xloc.bar_time, color=color.green, width=2, extend=extend.right)
+            label.new(time, sl_long, "SL", xloc=xloc.bar_time, color=color.red, textcolor=color.white, 
                      style=label.style_label_up, size=size.tiny)
-            label.new(bar_index, tp_long, "TP", color=color.green, textcolor=color.white, 
+            label.new(time, tp_long, "TP", xloc=xloc.bar_time, color=color.green, textcolor=color.white, 
                      style=label.style_label_down, size=size.tiny)
         
         else if conf_direction == "short"
             stop_distance = sl_short - close
             pos_size = f_calculate_position_size(stop_distance, i_risk_account_size, i_risk_per_trade)
             
-            line.new(bar_index, sl_short, bar_index + 5, sl_short, color=color.red, width=2)
-            line.new(bar_index, tp_short, bar_index + 5, tp_short, color=color.green, width=2)
-            label.new(bar_index, sl_short, "SL", color=color.red, textcolor=color.white, 
+            line.new(time, sl_short, time, sl_short, xloc=xloc.bar_time, color=color.red, width=2, extend=extend.right)
+            line.new(time, tp_short, time, tp_short, xloc=xloc.bar_time, color=color.green, width=2, extend=extend.right)
+            label.new(time, sl_short, "SL", xloc=xloc.bar_time, color=color.red, textcolor=color.white, 
                      style=label.style_label_down, size=size.tiny)
-            label.new(bar_index, tp_short, "TP", color=color.green, textcolor=color.white, 
+            label.new(time, tp_short, "TP", xloc=xloc.bar_time, color=color.green, textcolor=color.white, 
                      style=label.style_label_up, size=size.tiny)
 
 // ============================================================================
