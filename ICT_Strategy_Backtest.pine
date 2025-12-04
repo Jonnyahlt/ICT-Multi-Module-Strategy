@@ -73,8 +73,8 @@ f_detect_bullish_ob() =>
         if close[1] < open[1]
             body_size = open[1] - close[1]
             lower_wick = close[1] - low[1]
-            wick_ratio = lower_wick / body_size
-            volume_ratio = volume[1] / volume_sma
+            wick_ratio = body_size > 0 ? lower_wick / body_size : 0
+            volume_ratio = volume_sma > 0 ? volume[1] / volume_sma : 1
             
             if wick_ratio <= i_ob_wick_threshold
                 is_ob := true
@@ -96,8 +96,8 @@ f_detect_bearish_ob() =>
         if close[1] > open[1]
             body_size = close[1] - open[1]
             upper_wick = high[1] - close[1]
-            wick_ratio = upper_wick / body_size
-            volume_ratio = volume[1] / volume_sma
+            wick_ratio = body_size > 0 ? upper_wick / body_size : 0
+            volume_ratio = volume_sma > 0 ? volume[1] / volume_sma : 1
             
             if wick_ratio <= i_ob_wick_threshold
                 is_ob := true
@@ -115,10 +115,10 @@ if i_show_ob
             box.delete(oldest_ob.box_id)
         
         ob_color = bull_strength == 3 ? color.new(color.green, 80) : bull_strength == 2 ? color.new(color.green, 85) : color.new(color.green, 90)
-        box_id = box.new(bar_index[1], bull_top, bar_index + i_ob_zone_extension, bull_bottom, 
+        box_id = box.new(bar_index - 1, bull_top, bar_index + i_ob_zone_extension, bull_bottom, 
                          border_color=color.green, bgcolor=ob_color, 
                          text="OB+" + str.tostring(bull_strength), text_size=size.small)
-        array.push(active_obs, OrderBlock.new(bull_top, bull_bottom, bull_strength, true, bar_index[1], box_id))
+        array.push(active_obs, OrderBlock.new(bull_top, bull_bottom, bull_strength, true, bar_index - 1, box_id))
     
     [is_bearish_ob, bear_top, bear_bottom, bear_strength] = f_detect_bearish_ob()
     if is_bearish_ob
@@ -127,10 +127,10 @@ if i_show_ob
             box.delete(oldest_ob.box_id)
         
         ob_color = bear_strength == 3 ? color.new(color.red, 80) : bear_strength == 2 ? color.new(color.red, 85) : color.new(color.red, 90)
-        box_id = box.new(bar_index[1], bear_top, bar_index + i_ob_zone_extension, bear_bottom, 
+        box_id = box.new(bar_index - 1, bear_top, bar_index + i_ob_zone_extension, bear_bottom, 
                          border_color=color.red, bgcolor=ob_color, 
                          text="OB-" + str.tostring(bear_strength), text_size=size.small)
-        array.push(active_obs, OrderBlock.new(bear_top, bear_bottom, bear_strength, false, bar_index[1], box_id))
+        array.push(active_obs, OrderBlock.new(bear_top, bear_bottom, bear_strength, false, bar_index - 1, box_id))
     
     if array.size(active_obs) > 0
         for i = array.size(active_obs) - 1 to 0
@@ -204,10 +204,10 @@ if i_show_fvg
             box.delete(oldest_fvg.box_id)
         
         fvg_color = color.new(color.green, 85)
-        box_id = box.new(bar_index[1], bull_fvg_top, bar_index + i_fvg_zone_extension, bull_fvg_bottom,
+        box_id = box.new(bar_index - 1, bull_fvg_top, bar_index + i_fvg_zone_extension, bull_fvg_bottom,
                          border_color=color.green, bgcolor=fvg_color, border_style=line.style_dashed,
                          text="FVG↑", text_size=size.small)
-        array.push(active_fvgs, FairValueGap.new(bull_fvg_top, bull_fvg_bottom, true, bar_index[1], box_id, false))
+        array.push(active_fvgs, FairValueGap.new(bull_fvg_top, bull_fvg_bottom, true, bar_index - 1, box_id, false))
     
     [is_bear_fvg, bear_fvg_top, bear_fvg_bottom] = f_detect_bearish_fvg()
     if is_bear_fvg
@@ -216,10 +216,10 @@ if i_show_fvg
             box.delete(oldest_fvg.box_id)
         
         fvg_color = color.new(color.red, 85)
-        box_id = box.new(bar_index[1], bear_fvg_top, bar_index + i_fvg_zone_extension, bear_fvg_bottom,
+        box_id = box.new(bar_index - 1, bear_fvg_top, bar_index + i_fvg_zone_extension, bear_fvg_bottom,
                          border_color=color.red, bgcolor=fvg_color, border_style=line.style_dashed,
                          text="FVG↓", text_size=size.small)
-        array.push(active_fvgs, FairValueGap.new(bear_fvg_top, bear_fvg_bottom, false, bar_index[1], box_id, false))
+        array.push(active_fvgs, FairValueGap.new(bear_fvg_top, bear_fvg_bottom, false, bar_index - 1, box_id, false))
     
     if array.size(active_fvgs) > 0
         for i = array.size(active_fvgs) - 1 to 0
@@ -275,7 +275,7 @@ if i_show_bos
         volume_ok = not i_bos_volume_filter or volume > volume_sma * i_bos_volume_threshold
         
         if move_pct >= i_bos_min_move and volume_ok
-            line.new(bar_index[i_bos_lookback], swing_high, bar_index, swing_high,
+            line.new(bar_index - i_bos_lookback, swing_high, bar_index, swing_high,
                     color=color.green, width=2, style=line.style_solid)
             label.new(bar_index, swing_high, "BOS↑", color=color.green, textcolor=color.white, 
                      style=label.style_label_up, size=size.small)
@@ -286,7 +286,7 @@ if i_show_bos
         volume_ok = not i_bos_volume_filter or volume > volume_sma * i_bos_volume_threshold
         
         if move_pct >= i_bos_min_move and volume_ok
-            line.new(bar_index[i_bos_lookback], swing_low, bar_index, swing_low,
+            line.new(bar_index - i_bos_lookback, swing_low, bar_index, swing_low,
                     color=color.red, width=2, style=line.style_solid)
             label.new(bar_index, swing_low, "BOS↓", color=color.red, textcolor=color.white, 
                      style=label.style_label_down, size=size.small)
@@ -337,11 +337,11 @@ if i_show_liquidity
             oldest_liq = array.shift(liquidity_pools)
             line.delete(oldest_liq.line_id)
         
-        line_id = line.new(bar_index[i_liq_lookback], liq_high, bar_index + 10, liq_high,
+        line_id = line.new(bar_index - i_liq_lookback, liq_high, bar_index + 10, liq_high,
                           color=color.yellow, width=1, style=line.style_dotted)
-        label.new(bar_index[i_liq_lookback], liq_high, "LIQ", color=color.yellow, 
+        label.new(bar_index - i_liq_lookback, liq_high, "LIQ", color=color.yellow, 
                  textcolor=color.black, style=label.style_label_down, size=size.tiny)
-        array.push(liquidity_pools, LiquidityPool.new(liq_high, true, bar_index[i_liq_lookback], line_id))
+        array.push(liquidity_pools, LiquidityPool.new(liq_high, true, bar_index - i_liq_lookback, line_id))
     
     [is_sig_low, liq_low] = f_liquidity_low()
     if is_sig_low
@@ -349,11 +349,11 @@ if i_show_liquidity
             oldest_liq = array.shift(liquidity_pools)
             line.delete(oldest_liq.line_id)
         
-        line_id = line.new(bar_index[i_liq_lookback], liq_low, bar_index + 10, liq_low,
+        line_id = line.new(bar_index - i_liq_lookback, liq_low, bar_index + 10, liq_low,
                           color=color.yellow, width=1, style=line.style_dotted)
-        label.new(bar_index[i_liq_lookback], liq_low, "LIQ", color=color.yellow, 
+        label.new(bar_index - i_liq_lookback, liq_low, "LIQ", color=color.yellow, 
                  textcolor=color.black, style=label.style_label_up, size=size.tiny)
-        array.push(liquidity_pools, LiquidityPool.new(liq_low, false, bar_index[i_liq_lookback], line_id))
+        array.push(liquidity_pools, LiquidityPool.new(liq_low, false, bar_index - i_liq_lookback, line_id))
     
     if array.size(liquidity_pools) > 0
         for i = array.size(liquidity_pools) - 1 to 0
@@ -379,8 +379,9 @@ type Po3Phase
     float manip_level
     float expansion_target
     int start_bar
+    line target_line
 
-var Po3Phase current_po3 = Po3Phase.new("accumulation", 0.0, 0.0, 0.0, 0.0, 0)
+var Po3Phase current_po3 = Po3Phase.new("accumulation", 0.0, 0.0, 0.0, 0.0, 0, na)
 var bool po3_active = false
 
 f_detect_accumulation() =>
@@ -435,10 +436,14 @@ if i_show_po3 and i_po3_enabled
             label.new(bar_index, high, "Po3 MANIP↑→↓", color=color.blue, textcolor=color.white, 
                      style=label.style_label_down, size=size.small)
         
+        // Create new expansion target line
+        current_po3.target_line := line.new(bar_index, current_po3.expansion_target, bar_index + 20, current_po3.expansion_target, 
+                                            color=color.blue, width=2, style=line.style_dashed)
         po3_active := true
     
-    if po3_active and current_po3.phase == "manipulation"
-        line.new(bar_index - 1, current_po3.expansion_target, bar_index, current_po3.expansion_target, color=color.blue, width=2, style=line.style_dashed)
+    // Extend the target line each bar
+    if po3_active and current_po3.phase == "manipulation" and not na(current_po3.target_line)
+        line.set_x2(current_po3.target_line, bar_index + 20)
 
 // ============================================================================
 // MODULE 6: MULTI-TF CONFLUENCE ENGINE
@@ -578,13 +583,13 @@ plot(strategy.equity, "Equity", color=color.blue, linewidth=2, display=display.n
 // ============================================================================
 // PERFORMANCE METRICS (displayed in Data Window)
 // ============================================================================
-// Calculate additional metrics
+// Calculate additional metrics with division by zero protection
 total_trades = strategy.closedtrades
-win_rate = strategy.wintrades / total_trades * 100
-profit_factor = strategy.grossprofit / strategy.grossloss
-avg_win = strategy.grossprofit / strategy.wintrades
-avg_loss = strategy.grossloss / strategy.losstrades
-rr_ratio = avg_win / avg_loss
+win_rate = total_trades > 0 ? strategy.wintrades / total_trades * 100 : 0
+profit_factor = strategy.grossloss > 0 ? strategy.grossprofit / strategy.grossloss : 0
+avg_win = strategy.wintrades > 0 ? strategy.grossprofit / strategy.wintrades : 0
+avg_loss = strategy.losstrades > 0 ? strategy.grossloss / strategy.losstrades : 0
+rr_ratio = avg_loss > 0 ? avg_win / avg_loss : 0
 expectancy = (win_rate / 100 * avg_win) - ((1 - win_rate / 100) * avg_loss)
 
 // Display key metrics (visible in Data Window)

@@ -75,8 +75,8 @@ f_detect_bullish_ob() =>
         if close[1] < open[1]
             body_size = open[1] - close[1]
             lower_wick = close[1] - low[1]
-            wick_ratio = lower_wick / body_size
-            volume_ratio = volume[1] / volume_sma
+            wick_ratio = body_size > 0 ? lower_wick / body_size : 0
+            volume_ratio = volume_sma > 0 ? volume[1] / volume_sma : 1
             
             if wick_ratio <= i_ob_wick_threshold
                 is_ob := true
@@ -101,8 +101,8 @@ f_detect_bearish_ob() =>
         if close[1] > open[1]
             body_size = close[1] - open[1]
             upper_wick = high[1] - close[1]
-            wick_ratio = upper_wick / body_size
-            volume_ratio = volume[1] / volume_sma
+            wick_ratio = body_size > 0 ? upper_wick / body_size : 0
+            volume_ratio = volume_sma > 0 ? volume[1] / volume_sma : 1
             
             if wick_ratio <= i_ob_wick_threshold
                 is_ob := true
@@ -483,8 +483,9 @@ type Po3Phase
     float manip_level
     float expansion_target
     int start_bar
+    line target_line
 
-var Po3Phase current_po3 = Po3Phase.new("accumulation", 0.0, 0.0, 0.0, 0.0, 0)
+var Po3Phase current_po3 = Po3Phase.new("accumulation", 0.0, 0.0, 0.0, 0.0, 0, na)
 var bool po3_active = false
 
 // Detect accumulation range
@@ -546,11 +547,14 @@ if i_show_po3 and i_po3_enabled
             label.new(bar_index, high, "Po3 MANIP↑→↓", color=color.blue, textcolor=color.white, 
                      style=label.style_label_down, size=size.small)
         
+        // Create new expansion target line
+        current_po3.target_line := line.new(bar_index, current_po3.expansion_target, bar_index + 20, current_po3.expansion_target, 
+                                            color=color.blue, width=2, style=line.style_dashed)
         po3_active := true
     
-    // Draw expansion target
-    if po3_active and current_po3.phase == "manipulation"
-        line.new(bar_index, current_po3.expansion_target, bar_index + 10, current_po3.expansion_target, color=color.blue, width=2, style=line.style_dashed)
+    // Extend the target line each bar
+    if po3_active and current_po3.phase == "manipulation" and not na(current_po3.target_line)
+        line.set_x2(current_po3.target_line, bar_index + 20)
 
 // ============================================================================
 // MODULE 6: MULTI-TF CONFLUENCE ENGINE
