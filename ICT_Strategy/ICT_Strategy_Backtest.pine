@@ -1,0 +1,1063 @@
+//@version=6
+strategy("ICT Multi-Module Strategy [v6: PartialExits + Breakeven + HTF]", overlay=true,
+         initial_capital=10000,
+         default_qty_type=strategy.percent_of_equity,
+         default_qty_value=100,
+         commission_type=strategy.commission.percent,
+         commission_value=0.1,
+         slippage=2,
+         max_boxes_count=100,
+         max_lines_count=100)
+
+// ========== BACKTEST ==========
+i_start_date = input.time(timestamp("2020-01-01 00:00"), "Start date", group="Backtest")
+i_end_date   = input.time(timestamp("2099-12-31 23:59"), "End date", group="Backtest")
+in_date_range = time >= i_start_date and time <= i_end_date
+i_dir = input.string("Both", "Trade direction", options=["Long","Short","Both"], group="Backtest")
+
+// ========== MARKET DETECTION ==========
+i_market_type = input.string("Auto", "Market Type", options=["Auto", "Crypto", "Forex", "Stocks", "Indices"], group="Market", tooltip="Auto detects from symbol. Crypto = 24/7, high vol. Stocks/Indices = session-based, lower vol.")
+
+// Auto-detect market type
+var string detected_market = "Crypto"  // Default
+if i_market_type == "Auto"
+    symbol_lower = str.lower(syminfo.tickerid)
+    // Crypto detection (catch all pairs: BTCUSD, BTCUSDT, BTCPERP, etc)
+    if str.contains(symbol_lower, "btc") or str.contains(symbol_lower, "eth") or str.contains(symbol_lower, "sol") or str.contains(symbol_lower, "ada") or str.contains(symbol_lower, "doge") or str.contains(symbol_lower, "usdt") or str.contains(symbol_lower, "usdc") or str.contains(symbol_lower, "perp")
+        detected_market := "Crypto"
+    // Forex detection
+    else if str.contains(symbol_lower, "usd") or str.contains(symbol_lower, "eur") or str.contains(symbol_lower, "gbp") or str.contains(symbol_lower, "jpy")
+        detected_market := "Forex"
+    // Index detection
+    else if str.contains(symbol_lower, "nq") or str.contains(symbol_lower, "es") or str.contains(symbol_lower, "ym") or str.contains(symbol_lower, "rty") or str.contains(symbol_lower, "spx")
+        detected_market := "Indices"
+    // Stocks
+    else
+        detected_market := "Stocks"
+else
+    detected_market := i_market_type
+
+// Adaptive settings based on market
+is_crypto = detected_market == "Crypto"
+is_forex  = detected_market == "Forex"
+is_stocks = detected_market == "Stocks"
+is_indices = detected_market == "Indices"
+
+// ========== GLOBAL TOGGLES ==========
+// Tänd/släck moduler för att se vilka zoner som påverkar entries
+i_show_ob   = input.bool(true, "Show Order Blocks", group="Global", tooltip="Yellow/Orange boxes = entry zones")
+i_show_fvg  = input.bool(true, "Show FVG", group="Global", tooltip="Green/Red dashed boxes = gap zones")
+i_show_bos  = input.bool(true, "Show BOS", group="Global", tooltip="Green/Red lines = trend shifts")
+i_show_liq  = input.bool(true, "Show Liquidity", group="Global", tooltip="Aqua dotted lines = stop hunt areas")
+i_show_po3  = input.bool(true, "Show Po3", group="Global", tooltip="Blue line = expansion target")
+i_show_conf = input.bool(true, "Show Confluence", group="Global", tooltip="Label showing trade quality %")
+
+// Alerts
+i_alert_ob   = input.bool(true, "Alert: OB touch", group="Alerts")
+i_alert_fvg  = input.bool(true, "Alert: FVG first test", group="Alerts")
+i_alert_liq  = input.bool(true, "Alert: Liquidity sweep", group="Alerts")
+i_alert_conf = input.bool(true, "Alert: Confluence >= threshold", group="Alerts")
+
+// Visual limits
+i_max_ob   = input.int(5, "Max OB", 1, 10, group="Visual limits")
+i_max_fvg  = input.int(5, "Max FVG", 1, 10, group="Visual limits")
+i_max_liq  = input.int(5, "Max Liquidity", 1, 10, group="Visual limits")
+
+// ========== LIFECYCLE / RESET ==========
+var string prev_tf     = timeframe.period
+var string prev_ticker = ticker.standard(syminfo.tickerid)
+var bool needs_reset   = false
+
+if timeframe.period != prev_tf or ticker.standard(syminfo.tickerid) != prev_ticker
+    prev_tf     := timeframe.period
+    prev_ticker := ticker.standard(syminfo.tickerid)
+    needs_reset := true
+
+// Simplified object tracking (no overhead arrays)
+f_track_box(box b) => b
+f_track_line(line l) => l
+f_track_label(label lb) => lb
+
+// ========== COMMONS ==========
+atr = ta.atr(14)
+var string current_trend = "neutral"
+
+// Po3 globals (must be declared early for use in confluence)
+type Po3Phase
+    string phase
+    float acc_high
+    float acc_low
+    float manip_level
+    float expansion_target
+    int start_bar
+    line target_line
+    label label_id
+
+var Po3Phase PO3 = Po3Phase.new("accumulation", na, na, na, na, na, na, na)
+var bool po3_active = false
+
+// ========== HTF BIAS ==========
+i_mtf_enabled = input.bool(true, "Enable HTF bias", group="HTF")
+i_htf_mode = input.string("Adaptive", "HTF Mode", options=["Adaptive", "Single TF", "Dual TF"], group="HTF", tooltip="Adaptive: Daily for indices/stocks (recommended), Dual TF for crypto/forex")
+i_htf_1 = input.timeframe("240", "HTF-1", group="HTF", tooltip="Recommended: D (Daily) for indices/stocks, 240 (4H) for crypto")
+i_htf_2 = input.timeframe("D", "HTF-2", group="HTF", tooltip="Recommended: Leave as D (Daily) for strongest bias")
+
+// Determine if we should use dual TF based on market
+// Adaptive: Always use dual TF but with DAILY as HTF-2 for indices (stronger filter)
+use_dual_tf = i_htf_mode == "Dual TF" or i_htf_mode == "Adaptive"
+
+htf_close_1 = i_mtf_enabled ? request.security(syminfo.tickerid, i_htf_1, close) : na
+htf_close_2 = use_dual_tf ? request.security(syminfo.tickerid, i_htf_2, close) : na
+htf_ma_1    = i_mtf_enabled ? request.security(syminfo.tickerid, i_htf_1, ta.sma(close, 50)) : na
+htf_ma_2    = use_dual_tf ? request.security(syminfo.tickerid, i_htf_2, ta.sma(close, 50)) : na
+
+// Adaptive HTF bias: Single TF for stocks/indices (less strict), Dual TF for crypto/forex
+htf_bias_bull = not i_mtf_enabled ? true : use_dual_tf ? (htf_close_1 > htf_ma_1 and htf_close_2 > htf_ma_2) : (htf_close_1 > htf_ma_1)
+htf_bias_bear = not i_mtf_enabled ? true : use_dual_tf ? (htf_close_1 < htf_ma_1 and htf_close_2 < htf_ma_2) : (htf_close_1 < htf_ma_1)
+
+// Daily HTF for NQ Institutional (stronger than intraday)
+htf_daily_close = request.security(syminfo.tickerid, "D", close)
+htf_daily_ma = request.security(syminfo.tickerid, "D", ta.sma(close, 50))
+htf_daily_bull = htf_daily_close > htf_daily_ma
+htf_daily_bear = htf_daily_close < htf_daily_ma
+
+// ========== BOS ==========
+i_bos_lookback = input.int(10, "Swing lookback", 5, group="BOS")
+i_bos_min_atr = input.float(1.5, "Min move (x ATR)", 0.5, group="BOS", tooltip="ATR-baserad BOS threshold. 1.5 är standard, 1.0-2.5 för olika timeframes")
+i_bos_vol_filter = input.bool(true, "Volume filter", group="BOS")
+i_bos_vol_thr = input.float(1.2, "Vol threshold (x MA)", 1.0, group="BOS")
+i_bos_ext = input.int(20, "Line extension (bars)", 1, group="BOS")
+
+type BOSLine
+    float level
+    bool bull
+    int start_idx
+    line line_id
+    label label_id
+
+var array<BOSLine> BOSs = array.new<BOSLine>()
+
+f_swing_high(int lb) =>
+    hh = high[lb], ok = true
+    for i = 0 to lb - 1
+        if high[i] > hh
+            ok := false
+            break
+    for i = lb + 1 to lb * 2
+        if high[i] > hh
+            ok := false
+            break
+    ok ? hh : na
+
+f_swing_low(int lb) =>
+    ll = low[lb], ok = true
+    for i = 0 to lb - 1
+        if low[i] < ll
+            ok := false
+            break
+    for i = lb + 1 to lb * 2
+        if low[i] < ll
+            ok := false
+            break
+    ok ? ll : na
+
+if i_show_bos
+    sh = f_swing_high(i_bos_lookback)
+    sl = f_swing_low(i_bos_lookback)
+    vma = ta.sma(volume, 20)
+
+    if not na(sh) and close > sh and barstate.isconfirmed
+        move_size = close - sh
+        vok = not i_bos_vol_filter or volume > vma * i_bos_vol_thr
+        if move_size >= atr * i_bos_min_atr and vok
+            ln = line.new(bar_index - i_bos_lookback, sh, bar_index + i_bos_ext, sh, xloc=xloc.bar_index, color=color.green, width=2)
+            lb = label.new(bar_index - i_bos_lookback, sh, "BOS↑", xloc=xloc.bar_index, color=color.green, textcolor=color.white, style=label.style_label_up, size=size.tiny)
+            array.push(BOSs, BOSLine.new(sh, true, bar_index - i_bos_lookback, ln, lb))
+            f_track_line(ln)
+            f_track_label(lb)
+            current_trend := "bullish"
+
+    if not na(sl) and close < sl and barstate.isconfirmed
+        move_size = sl - close
+        vok = not i_bos_vol_filter or volume > vma * i_bos_vol_thr
+        if move_size >= atr * i_bos_min_atr and vok
+            ln = line.new(bar_index - i_bos_lookback, sl, bar_index + i_bos_ext, sl, xloc=xloc.bar_index, color=color.red, width=2)
+            lb = label.new(bar_index - i_bos_lookback, sl, "BOS↓", xloc=xloc.bar_index, color=color.red, textcolor=color.white, style=label.style_label_down, size=size.tiny)
+            array.push(BOSs, BOSLine.new(sl, false, bar_index - i_bos_lookback, ln, lb))
+            f_track_line(ln)
+            f_track_label(lb)
+            current_trend := "bearish"
+
+    if array.size(BOSs) > 0
+        for i = 0 to array.size(BOSs) - 1
+            b = array.get(BOSs, i)
+            line.set_x2(b.line_id, bar_index + i_bos_ext)
+            // Keep label at original BOS bar, don't move it
+            // label.set_x(b.label_id, bar_index)  // REMOVED: Caused labels to float
+
+// ========== ORDER BLOCKS ==========
+i_ob_wick_thr = input.float(0.3, "OB wick threshold", 0.0, 1.0, group="OB")
+i_ob_ext = input.int(30, "OB extension (bars)", 1, group="OB")
+i_ob_max_retests = input.int(3, "OB max retests", 0, 10, group="OB")
+i_ob_inval_close_beyond = input.bool(true, "Invalidate on close beyond", group="OB")
+
+type OrderBlock
+    float top
+    float bottom
+    int strength
+    bool bull
+    int start_idx
+    bool active
+    int retests
+    box box_id
+
+var array<OrderBlock> OBs = array.new<OrderBlock>()
+
+f_ob_strength(float body, float wick_ratio, float vol_ratio) =>
+    s = 0
+    if body > atr * 0.5
+        s += 1
+    if wick_ratio < i_ob_wick_thr
+        s += 1
+    if vol_ratio > 1.2
+        s += 1
+    s
+
+f_detect_bull_ob() =>
+    ok = false, top = 0.0, bot = 0.0, strn = 0
+    vma = ta.sma(volume, 20)
+    if close > open and close > open[1] and open < close[1] and close[1] < open[1]
+        body = open[1] - close[1]
+        lw = close[1] - low[1]
+        wr = body > 0 ? lw / body : 0
+        vr = vma > 0 ? volume[1] / vma : 1
+        if wr <= i_ob_wick_thr
+            ok := true, top := open[1], bot := close[1], strn := f_ob_strength(body, wr, vr)
+    [ok, top, bot, strn]
+
+f_detect_bear_ob() =>
+    ok = false, top = 0.0, bot = 0.0, strn = 0
+    vma = ta.sma(volume, 20)
+    if close < open and close < open[1] and open > close[1] and close[1] > open[1]
+        body = close[1] - open[1]
+        uw = high[1] - close[1]
+        wr = body > 0 ? uw / body : 0
+        vr = vma > 0 ? volume[1] / vma : 1
+        if wr <= i_ob_wick_thr
+            ok := true, top := close[1], bot := open[1], strn := f_ob_strength(body, wr, vr)
+    [ok, top, bot, strn]
+
+if i_show_ob
+    [b_ok, b_top, b_bot, b_str] = f_detect_bull_ob()
+    if b_ok and barstate.isconfirmed
+        if array.size(OBs) >= i_max_ob
+            old = array.shift(OBs)
+            box.delete(old.box_id)
+        clr = b_str == 3 ? color.new(color.yellow, 80) : b_str == 2 ? color.new(color.yellow, 85) : color.new(color.yellow, 90)
+        bx = box.new(bar_index - 1, b_top, bar_index + i_ob_ext, b_bot, xloc=xloc.bar_index, border_color=color.yellow, bgcolor=clr)
+        f_track_box(bx)
+        array.push(OBs, OrderBlock.new(b_top, b_bot, b_str, true, bar_index - 1, false, 0, bx))
+
+    [s_ok, s_top, s_bot, s_str] = f_detect_bear_ob()
+    if s_ok and barstate.isconfirmed
+        if array.size(OBs) >= i_max_ob
+            old = array.shift(OBs)
+            box.delete(old.box_id)
+        clr = s_str == 3 ? color.new(color.orange, 80) : s_str == 2 ? color.new(color.orange, 85) : color.new(color.orange, 90)
+        bx = box.new(bar_index - 1, s_top, bar_index + i_ob_ext, s_bot, xloc=xloc.bar_index, border_color=color.orange, bgcolor=clr)
+        f_track_box(bx)
+        array.push(OBs, OrderBlock.new(s_top, s_bot, s_str, false, bar_index - 1, false, 0, bx))
+
+if array.size(OBs) > 0
+    for i = array.size(OBs) - 1 to 0
+        ob = array.get(OBs, i)
+        box.set_right(ob.box_id, bar_index + i_ob_ext)
+        // OB is always active immediately after creation
+        touching = low <= ob.top and high >= ob.bottom
+        if touching
+            ob.retests += 1
+            array.set(OBs, i, ob)
+            if i_alert_ob
+                alert("OB touch: " + (ob.bull ? "Bullish" : "Bearish") + " zone", alert.freq_once_per_bar)
+        broken = ob.bull ? (i_ob_inval_close_beyond ? close < ob.bottom : low < ob.bottom)
+                         : (i_ob_inval_close_beyond ? close > ob.top    : high > ob.top)
+        too_many = (i_ob_max_retests > 0 and ob.retests > i_ob_max_retests)
+        if broken or too_many
+            box.delete(ob.box_id)
+            array.remove(OBs, i)
+
+// ========== FVG ==========
+i_fvg_min_atr_input = input.float(0.0, "FVG min size (%ATR)", 0.0, group="FVG", tooltip="0 = Auto (0.3 for indices, 0.2 forex, 0.1 crypto). Higher = fewer but stronger FVG")
+i_fvg_ext     = input.int(30, "FVG extension (bars)", 1, group="FVG")
+i_fvg_inval   = input.string("full_fill", "FVG invalidation", options=["full_fill","close_inside","midpoint"], group="FVG")
+
+// Adaptive FVG min size (filter out noise gaps)
+i_fvg_min_atr = i_fvg_min_atr_input == 0.0 ? ((is_indices or is_stocks) ? 0.3 : is_forex ? 0.2 : 0.1) : i_fvg_min_atr_input
+
+type FairValueGap
+    float top
+    float bottom
+    bool bull
+    int start_idx
+    bool tested
+    box box_id
+
+var array<FairValueGap> FVGs = array.new<FairValueGap>()
+
+f_detect_bull_fvg() =>
+    ok = false, top = 0.0, bot = 0.0
+    if low > high[2]
+        gap = low - high[2]
+        if gap >= atr * i_fvg_min_atr
+            ok := true, top := low, bot := high[2]
+    [ok, top, bot]
+
+f_detect_bear_fvg() =>
+    ok = false, top = 0.0, bot = 0.0
+    if high < low[2]
+        gap = low[2] - high
+        if gap >= atr * i_fvg_min_atr
+            ok := true, top := low[2], bot := high
+    [ok, top, bot]
+
+if i_show_fvg
+    [fb, ftop, fbot] = f_detect_bull_fvg()
+    if fb and barstate.isconfirmed
+        if array.size(FVGs) >= i_max_fvg
+            old = array.shift(FVGs)
+            box.delete(old.box_id)
+        c = color.new(color.green, 85)
+        bx = box.new(bar_index - 2, ftop, bar_index + i_fvg_ext, fbot, xloc=xloc.bar_index, border_color=color.green, bgcolor=c, border_style=line.style_dashed)
+        f_track_box(bx)
+        array.push(FVGs, FairValueGap.new(ftop, fbot, true, bar_index - 2, false, bx))
+
+    [sb, stop, sbot] = f_detect_bear_fvg()
+    if sb and barstate.isconfirmed
+        if array.size(FVGs) >= i_max_fvg
+            old = array.shift(FVGs)
+            box.delete(old.box_id)
+        c = color.new(color.red, 85)
+        bx = box.new(bar_index - 2, stop, bar_index + i_fvg_ext, sbot, xloc=xloc.bar_index, border_color=color.red, bgcolor=c, border_style=line.style_dashed)
+        f_track_box(bx)
+        array.push(FVGs, FairValueGap.new(stop, sbot, false, bar_index - 2, false, bx))
+
+if array.size(FVGs) > 0
+    for i = array.size(FVGs) - 1 to 0
+        fvg = array.get(FVGs, i)
+        box.set_right(fvg.box_id, bar_index + i_fvg_ext)
+        tested_now = fvg.bull ? (low <= fvg.top and high >= fvg.bottom)
+                              : (high >= fvg.bottom and low <= fvg.top)
+        if tested_now and not fvg.tested
+            fvg.tested := true
+            array.set(FVGs, i, fvg)
+            if i_alert_fvg
+                alert("FVG first test: " + (fvg.bull ? "Bullish" : "Bearish"), alert.freq_once_per_bar)
+        mid = (fvg.top + fvg.bottom) * 0.5
+        full_fill   = fvg.bull ? close <= fvg.bottom : close >= fvg.top
+        close_inside= close >= fvg.bottom and close <= fvg.top
+        hit_mid     = fvg.bull ? low <= mid : high >= mid
+        inval = i_fvg_inval == "full_fill" ? full_fill : i_fvg_inval == "close_inside" ? close_inside : hit_mid
+        if inval
+            box.delete(fvg.box_id)
+            array.remove(FVGs, i)
+
+// ========== LIQUIDITY ==========
+i_liq_lookback = input.int(20, "Liquidity lookback", 5, group="LIQ")
+i_liq_min_swing = input.float(0.3, "Min swing (%ATR)", 0.1, group="LIQ")
+i_liq_ext = input.int(25, "Line extension (bars)", 1, group="LIQ")
+
+type LiquidityPool
+    float level
+    bool is_high
+    int start_idx
+    line line_id
+    label label_id
+
+var array<LiquidityPool> LIQs = array.new<LiquidityPool>()
+
+// Precompute once per bar for consistency
+liq_lowest  = ta.lowest(low,  i_liq_lookback * 2)
+liq_highest = ta.highest(high, i_liq_lookback * 2)
+
+f_liq_high() =>
+    ph = ta.pivothigh(high, i_liq_lookback, i_liq_lookback)
+    ok = false
+    if not na(ph)
+        sz = ph - liq_lowest
+        if sz >= atr * i_liq_min_swing
+            ok := true
+    [ok, ph]
+
+f_liq_low() =>
+    pl = ta.pivotlow(low, i_liq_lookback, i_liq_lookback)
+    ok = false
+    if not na(pl)
+        sz = liq_highest - pl
+        if sz >= atr * i_liq_min_swing
+            ok := true
+    [ok, pl]
+
+if i_show_liq
+    [okh, lh] = f_liq_high()
+    if okh and barstate.isconfirmed
+        if array.size(LIQs) >= i_max_liq
+            old = array.shift(LIQs)
+            line.delete(old.line_id)
+            if not na(old.label_id)
+                label.delete(old.label_id)
+        ln = line.new(bar_index - i_liq_lookback, lh, bar_index + i_liq_ext, lh, xloc=xloc.bar_index, color=color.aqua, width=1, style=line.style_dotted)
+        lb = label.new(bar_index - i_liq_lookback, lh + atr * 0.1, "LIQ", xloc=xloc.bar_index, color=color.aqua, textcolor=color.white, style=label.style_label_down, size=size.tiny)
+        f_track_line(ln)
+        f_track_label(lb)
+        array.push(LIQs, LiquidityPool.new(lh, true, bar_index - i_liq_lookback, ln, lb))
+    [okl, ll] = f_liq_low()
+    if okl and barstate.isconfirmed
+        if array.size(LIQs) >= i_max_liq
+            old = array.shift(LIQs)
+            line.delete(old.line_id)
+            if not na(old.label_id)
+                label.delete(old.label_id)
+        ln = line.new(bar_index - i_liq_lookback, ll, bar_index + i_liq_ext, ll, xloc=xloc.bar_index, color=color.aqua, width=1, style=line.style_dotted)
+        lb = label.new(bar_index - i_liq_lookback, ll - atr * 0.1, "LIQ", xloc=xloc.bar_index, color=color.aqua, textcolor=color.white, style=label.style_label_up, size=size.tiny)
+        f_track_line(ln)
+        f_track_label(lb)
+        array.push(LIQs, LiquidityPool.new(ll, false, bar_index - i_liq_lookback, ln, lb))
+
+if array.size(LIQs) > 0
+    for i = array.size(LIQs) - 1 to 0
+        liq = array.get(LIQs, i)
+        line.set_x2(liq.line_id, bar_index + i_liq_ext)
+        swept = liq.is_high ? high > liq.level : low < liq.level
+        if swept
+            if i_alert_liq
+                alert("Liquidity swept: " + (liq.is_high ? "High " : "Low ") + str.tostring(liq.level), alert.freq_once_per_bar)
+            line.delete(liq.line_id)
+            if not na(liq.label_id)
+                label.delete(liq.label_id)
+            array.remove(LIQs, i)
+
+// ========== Po3 ==========
+i_po3_enabled = input.bool(true, "Enable Po3", group="Po3")
+i_po3_depth   = input.int(5, "Fractal depth", 3, group="Po3")
+i_po3_mult    = input.float(1.5, "Expansion multiplier", 1.0, group="Po3")
+i_po3_ext     = input.int(30, "Target extension (bars)", 1, group="Po3")
+i_po3_man_thr = input.float(0.3, "Manip threshold (%ATR)", 0.1, group="Po3")
+
+f_po3_acc() =>
+    rh = ta.highest(high, i_po3_depth * 2)
+    rl = ta.lowest(low, i_po3_depth * 2)
+    sz = rh - rl
+    is_acc = sz < atr * 0.5
+    [is_acc, rh, rl]
+
+f_po3_manip(float acc_h, float acc_l) =>
+    is_man = false, level = 0.0, bull = false
+    if low < acc_l - atr * i_po3_man_thr
+        is_man := true
+        level := low
+        bull := true
+    if high > acc_h + atr * i_po3_man_thr
+        is_man := true
+        level := high
+        bull := false
+    [is_man, level, bull]
+
+if i_show_po3 and i_po3_enabled
+    [is_acc, acc_h, acc_l] = f_po3_acc()
+    if is_acc and PO3.phase == "accumulation"
+        PO3.acc_high := acc_h
+        PO3.acc_low  := acc_l
+        PO3.start_bar:= bar_index
+
+    [is_man, m_level, bull_man] = f_po3_manip(PO3.acc_high, PO3.acc_low)
+    if is_man and PO3.phase == "accumulation" and barstate.isconfirmed
+        PO3.phase := "manipulation"
+        PO3.manip_level := m_level
+        acc_range = PO3.acc_high - PO3.acc_low
+
+        // Declare lb before branching
+        var label lb = na
+        if bull_man
+            PO3.expansion_target := PO3.acc_high + acc_range * i_po3_mult
+            lb := label.new(bar_index, low - atr * 0.3, "Po3 MANIP↓→↑", xloc=xloc.bar_index, color=color.blue, textcolor=color.white, style=label.style_label_up, size=size.tiny)
+        else
+            PO3.expansion_target := PO3.acc_low - acc_range * i_po3_mult
+            lb := label.new(bar_index, high + atr * 0.3, "Po3 MANIP↑→↓", xloc=xloc.bar_index, color=color.blue, textcolor=color.white, style=label.style_label_down, size=size.tiny)
+
+        ln = line.new(bar_index, PO3.expansion_target, bar_index + i_po3_ext, PO3.expansion_target, xloc=xloc.bar_index, color=color.blue, width=2, style=line.style_dashed)
+        PO3.target_line := ln
+        PO3.label_id    := lb
+        f_track_line(ln)
+        f_track_label(lb)
+        po3_active := true
+
+    if po3_active and PO3.phase == "manipulation" and not na(PO3.target_line)
+        line.set_x2(PO3.target_line, bar_index + i_po3_ext)
+        // Keep Po3 label at manipulation bar, don't move it
+        // if not na(PO3.label_id)
+        //     label.set_x(PO3.label_id, bar_index)  // REMOVED: Caused label to float
+
+// ========== Confluence ==========
+// Entry Model
+i_entry_model = input.string("Silver Bullet", "Entry Model", 
+  options=["Silver Bullet", "NQ Institutional", "Unicorn", "Turtle Soup", "Classic ICT", "Aggressive"], 
+  group="Entry", 
+  tooltip="Silver Bullet: FVG/OB 50% + Liq sweep + HTF\nNQ Institutional: OB priority + Daily HTF + NY session (BEST FOR NQ/ES)\nUnicorn: Deep FVG retest + strong confluence\nTurtle Soup: Failed breakout + OB/FVG\nClassic ICT: 50% zone touch + confluence\nAggressive: Any zone touch")
+
+// Confluence threshold (will be adjusted adaptively for stocks/indices)
+i_conf_thr_input = input.int(50, "Confluence threshold", 0, 100, group="Confluence", tooltip="Default 50%. Auto-adjusted to 40% for stocks/indices if below 45%")
+
+// Adaptive confluence threshold (stocks/indices need lower threshold)
+i_conf_thr = (is_stocks or is_indices) and i_conf_thr_input <= 45 ? 40 : i_conf_thr_input
+
+// Session filters (for NQ Institutional model)
+i_session_filter = input.bool(false, "Enable session filter", group="Session", tooltip="Recommended ON for NQ/ES. Filters trades to high-volume sessions.")
+i_ny_open_start = input.int(930, "NY Open start (HHMM)", 0, 2359, group="Session", tooltip="930 = 09:30 ET")
+i_ny_open_end = input.int(1200, "NY Open end (HHMM)", 0, 2359, group="Session", tooltip="1200 = 12:00 ET (3hr window)")
+
+// Check if current time is within session (convert to exchange time)
+current_time_minutes = (hour * 100) + minute
+in_session = not i_session_filter or (current_time_minutes >= i_ny_open_start and current_time_minutes <= i_ny_open_end)
+
+// Adaptive confluence weights per market (0 = auto-optimized)
+i_w_htf     = input.float(0.0, "Weight HTF bias", 0, 100, group="Confluence", tooltip="0 = Auto (40% indices, 30% crypto). HTF trend alignment")
+i_w_liq     = input.float(0.0, "Weight LIQ", 0, 100, group="Confluence", tooltip="0 = Auto (15% indices, 35% crypto). Liquidity sweep/draw")
+i_w_fvg     = input.float(0.0, "Weight FVG", 0, 100, group="Confluence", tooltip="0 = Auto (10% indices, 20% crypto). Fair Value Gap zones")
+i_w_ob      = input.float(0.0, "Weight OB", 0, 100, group="Confluence", tooltip="0 = Auto (25% indices, 10% crypto). Order Block zones")
+i_w_bos     = input.float(0.0, "Weight BOS", 0, 100, group="Confluence", tooltip="0 = Auto (10% both). Break of Structure")
+i_w_po3     = input.float(0.0, "Weight Po3", 0, 100, group="Confluence", tooltip="0 = Auto (0% indices, 5% crypto). Power of Three phase")
+
+// Apply market-specific weights if set to 0 (auto)
+w_htf_actual = i_w_htf == 0.0 ? ((is_indices or is_stocks) ? 40.0 : 30.0) : i_w_htf
+w_liq_actual = i_w_liq == 0.0 ? ((is_indices or is_stocks) ? 15.0 : 35.0) : i_w_liq
+w_fvg_actual = i_w_fvg == 0.0 ? ((is_indices or is_stocks) ? 10.0 : 20.0) : i_w_fvg
+w_ob_actual  = i_w_ob == 0.0  ? ((is_indices or is_stocks) ? 25.0 : 10.0) : i_w_ob
+w_bos_actual = i_w_bos == 0.0 ? 10.0 : i_w_bos
+w_po3_actual = i_w_po3 == 0.0 ? ((is_indices or is_stocks) ? 0.0 : 5.0) : i_w_po3
+
+f_confluence() =>
+    ob_b = 0.0, ob_s = 0.0
+    if array.size(OBs) > 0
+        for i = 0 to array.size(OBs) - 1
+            ob = array.get(OBs, i)
+            if close >= ob.bottom and close <= ob.top
+                mul = ob.strength / 3.0
+                if ob.bull
+                    ob_b := math.max(ob_b, mul)
+                else
+                    ob_s := math.max(ob_s, mul)
+
+    fvg_b = 0.0, fvg_s = 0.0
+    if array.size(FVGs) > 0
+        for i = 0 to array.size(FVGs) - 1
+            fvg = array.get(FVGs, i)
+            if close >= fvg.bottom and close <= fvg.top
+                if fvg.bull
+                    fvg_b := 1.0
+                else
+                    fvg_s := 1.0
+
+    bos_b = current_trend == "bullish" ? 1.0 : 0.0
+    bos_s = current_trend == "bearish" ? 1.0 : 0.0
+
+    liq_b = 0.0, liq_s = 0.0
+    if array.size(LIQs) > 0
+        for i = 0 to array.size(LIQs) - 1
+            liq = array.get(LIQs, i)
+            dist = math.abs(close - liq.level)
+            if dist < atr * 0.5
+                if liq.is_high
+                    liq_s := 1.0
+                else
+                    liq_b := 1.0
+
+    po3_b = 0.0, po3_s = 0.0
+    if po3_active and not na(PO3.expansion_target)
+        sig = PO3.expansion_target > close ? 1.0 : -1.0
+        if sig > 0
+            po3_b := 1.0
+        else
+            po3_s := 1.0
+
+    htf_b = i_mtf_enabled and htf_bias_bull ? 1.0 : 0.0
+    htf_s = i_mtf_enabled and htf_bias_bear ? 1.0 : 0.0
+
+    wsum = w_ob_actual + w_fvg_actual + w_bos_actual + w_liq_actual + w_po3_actual + w_htf_actual
+    bull = (ob_b * w_ob_actual + fvg_b * w_fvg_actual + bos_b * w_bos_actual + liq_b * w_liq_actual + po3_b * w_po3_actual + htf_b * w_htf_actual) / (wsum == 0 ? 1 : wsum)
+    bear = (ob_s * w_ob_actual + fvg_s * w_fvg_actual + bos_s * w_bos_actual + liq_s * w_liq_actual + po3_s * w_po3_actual + htf_s * w_htf_actual) / (wsum == 0 ? 1 : wsum)
+    net = bull - bear
+    conf = math.round(math.max(bull, bear) * 100)
+    dir = net > 0 ? "long" : net < 0 ? "short" : "neutral"
+    [conf, dir]
+
+var int hold = 0
+var string prev_conf_dir = "neutral"
+[conf_score, conf_dir] = f_confluence()
+stable_dir = conf_dir
+
+// Reversal kräver 2-3 bars bekräftelse beroende på marknad (NQ = snabbare, crypto = långsammare)
+reversal_detected = (prev_conf_dir == "long" and conf_dir == "short") or (prev_conf_dir == "short" and conf_dir == "long")
+required_hold = reversal_detected ? ((is_indices or is_stocks) ? 2 : 3) : ((is_indices or is_stocks) ? 1 : 2)
+
+if conf_score >= i_conf_thr
+    if conf_dir == prev_conf_dir or prev_conf_dir == "neutral"
+        hold += 1
+    else
+        hold := 1  // Reset vid riktningsändring
+    
+    if hold < required_hold
+        stable_dir := "neutral"
+else
+    hold := 0
+
+prev_conf_dir := conf_dir
+
+var label conf_label = na
+if i_show_conf
+    if not na(conf_label)
+        label.delete(conf_label)
+    if conf_score >= i_conf_thr
+        lc = stable_dir == "long" ? color.green : stable_dir == "short" ? color.red : color.gray
+        txt = stable_dir + " " + str.tostring(conf_score, "#") + "%"
+        conf_label := label.new(bar_index, high + atr * 0.5, txt, xloc=xloc.bar_index, color=lc, textcolor=color.white, style=label.style_label_down, size=size.normal)
+        f_track_label(conf_label)
+        if i_alert_conf and (stable_dir == "long" or stable_dir == "short")
+            alert("Confluence: " + stable_dir + " " + str.tostring(conf_score, "#") + "%", alert.freq_once_per_bar)
+
+// ========== INFO DASHBOARD ==========
+i_show_dashboard = input.bool(true, "Show Info Dashboard", group="Dashboard")
+
+// Initialize dashboard once (prevents deletion on settings change)
+var table dashboard = na
+
+if i_show_dashboard and barstate.islast
+    if na(dashboard)
+        dashboard := table.new(position.top_right, 2, 11, border_width=1, frame_color=color.gray, frame_width=2)
+    // Reuse existing table or create new
+    if na(dashboard)
+        dashboard := table.new(position.top_right, 2, 11, border_width=1, frame_color=color.gray, frame_width=2)
+    
+    // Clear and repopulate (prevents stale data)
+    table.clear(dashboard, 0, 0, 1, 10)
+    
+    // Header
+    table.cell(dashboard, 0, 0, "ICT Strategy", text_color=color.white, bgcolor=color.new(color.gray, 20), text_size=size.normal)
+    table.cell(dashboard, 1, 0, detected_market, text_color=color.white, bgcolor=color.new(color.blue, 70), text_size=size.small)  // Show market type
+    
+    // HTF Bias (moved to row 2)
+    htf_status = htf_bias_bull ? "BULLISH" : htf_bias_bear ? "BEARISH" : "NEUTRAL"
+    htf_mode_display = use_dual_tf ? "(Dual TF)" : "(Single TF)"
+    htf_color = htf_bias_bull ? color.new(color.green, 70) : htf_bias_bear ? color.new(color.red, 70) : color.new(color.gray, 70)
+    table.cell(dashboard, 0, 1, "HTF Bias", text_color=color.white, bgcolor=color.new(color.gray, 80), text_size=size.small)
+    table.cell(dashboard, 1, 1, htf_status + " " + htf_mode_display, text_color=color.white, bgcolor=htf_color, text_size=size.tiny)
+    
+    // Confluence
+    conf_text = str.tostring(conf_score, "#") + "%"
+    conf_color = conf_score >= 70 ? color.new(color.green, 70) : conf_score >= 50 ? color.new(color.orange, 70) : color.new(color.red, 70)
+    table.cell(dashboard, 0, 2, "Confluence", text_color=color.white, bgcolor=color.new(color.gray, 80), text_size=size.small)
+    table.cell(dashboard, 1, 2, conf_text, text_color=color.white, bgcolor=conf_color, text_size=size.small)
+    
+    // Direction
+    dir_text = stable_dir == "long" ? "LONG" : stable_dir == "short" ? "SHORT" : "NEUTRAL"
+    dir_color = stable_dir == "long" ? color.new(color.green, 70) : stable_dir == "short" ? color.new(color.red, 70) : color.new(color.gray, 70)
+    table.cell(dashboard, 0, 3, "Direction", text_color=color.white, bgcolor=color.new(color.gray, 80), text_size=size.small)
+    table.cell(dashboard, 1, 3, dir_text, text_color=color.white, bgcolor=dir_color, text_size=size.small)
+    
+    // Trend (BOS)
+    trend_text = current_trend == "bullish" ? "BULLISH" : current_trend == "bearish" ? "BEARISH" : "NEUTRAL"
+    trend_color = current_trend == "bullish" ? color.new(color.green, 70) : current_trend == "bearish" ? color.new(color.red, 70) : color.new(color.gray, 70)
+    table.cell(dashboard, 0, 4, "BOS Trend", text_color=color.white, bgcolor=color.new(color.gray, 80), text_size=size.small)
+    table.cell(dashboard, 1, 4, trend_text, text_color=color.white, bgcolor=trend_color, text_size=size.small)
+    
+    // Hold bars (uthållighet)
+    hold_text = str.tostring(hold) + "/" + str.tostring(required_hold)
+    hold_color = hold >= required_hold ? color.new(color.green, 70) : color.new(color.orange, 70)
+    table.cell(dashboard, 0, 5, "Hold Bars", text_color=color.white, bgcolor=color.new(color.gray, 80), text_size=size.small)
+    table.cell(dashboard, 1, 5, hold_text, text_color=color.white, bgcolor=hold_color, text_size=size.small)
+    
+    // Active zones
+    zones_text = str.tostring(array.size(OBs)) + " OB | " + str.tostring(array.size(FVGs)) + " FVG"
+    table.cell(dashboard, 0, 6, "Active Zones", text_color=color.white, bgcolor=color.new(color.gray, 80), text_size=size.small)
+    table.cell(dashboard, 1, 6, zones_text, text_color=color.white, bgcolor=color.new(color.gray, 70), text_size=size.small)
+    
+    // ATR
+    atr_text = str.tostring(atr, format.mintick)
+    table.cell(dashboard, 0, 7, "ATR(14)", text_color=color.white, bgcolor=color.new(color.gray, 80), text_size=size.small)
+    table.cell(dashboard, 1, 7, atr_text, text_color=color.white, bgcolor=color.new(color.gray, 70), text_size=size.small)
+    
+    // Conf Threshold (row 8)
+    thr_text = str.tostring(i_conf_thr) + "%"
+    table.cell(dashboard, 0, 8, "Conf Thr", text_color=color.white, bgcolor=color.new(color.gray, 80), text_size=size.small)
+    table.cell(dashboard, 1, 8, thr_text, text_color=color.white, bgcolor=color.new(color.gray, 70), text_size=size.small)
+    
+    // Daily HTF (row 9)
+    daily_status = htf_daily_bull ? "BULL" : htf_daily_bear ? "BEAR" : "NEUTRAL"
+    daily_color = htf_daily_bull ? color.new(color.green, 70) : htf_daily_bear ? color.new(color.red, 70) : color.new(color.gray, 70)
+    table.cell(dashboard, 0, 9, "Daily HTF", text_color=color.white, bgcolor=color.new(color.gray, 80), text_size=size.small)
+    table.cell(dashboard, 1, 9, daily_status, text_color=color.white, bgcolor=daily_color, text_size=size.small)
+    
+    // Session (row 10)
+    session_status = in_session ? "ACTIVE" : "CLOSED"
+    session_color = in_session ? color.new(color.green, 70) : color.new(color.gray, 70)
+    table.cell(dashboard, 0, 10, "Session", text_color=color.white, bgcolor=color.new(color.gray, 80), text_size=size.small)
+    table.cell(dashboard, 1, 10, session_status, text_color=color.white, bgcolor=session_color, text_size=size.small)
+    
+    // Confluence weights indicator (shows if optimized for this market)
+    weights_optimized = (i_w_htf == 0.0 and i_w_liq == 0.0 and i_w_fvg == 0.0 and i_w_ob == 0.0)
+    // No need for row 11 - keep compact at 11 rows total
+
+// ========== HTF LIQUIDITY ==========
+i_htf_liq_enabled = input.bool(false, "Enable HTF Liquidity", group="HTF Liquidity")
+i_htf_liq_tf1 = input.timeframe("60", "HTF-LIQ 1", group="HTF Liquidity")
+i_htf_liq_tf2 = input.timeframe("240", "HTF-LIQ 2", group="HTF Liquidity")
+i_htf_liq_ext = input.int(50, "HTF LIQ extension (bars)", 1, group="HTF Liquidity")
+
+htf_liq_high_1 = i_htf_liq_enabled ? request.security(syminfo.tickerid, i_htf_liq_tf1, ta.pivothigh(high, 5, 5)) : na
+htf_liq_low_1  = i_htf_liq_enabled ? request.security(syminfo.tickerid, i_htf_liq_tf1, ta.pivotlow(low, 5, 5))  : na
+htf_liq_high_2 = i_htf_liq_enabled ? request.security(syminfo.tickerid, i_htf_liq_tf2, ta.pivothigh(high, 5, 5)) : na
+htf_liq_low_2  = i_htf_liq_enabled ? request.security(syminfo.tickerid, i_htf_liq_tf2, ta.pivotlow(low, 5, 5))  : na
+
+var line htf_liq_ln1_high = na
+var line htf_liq_ln1_low  = na
+var line htf_liq_ln2_high = na
+var line htf_liq_ln2_low  = na
+
+if i_htf_liq_enabled and barstate.isconfirmed
+    if not na(htf_liq_high_1)
+        if not na(htf_liq_ln1_high)
+            line.delete(htf_liq_ln1_high)
+        htf_liq_ln1_high := line.new(bar_index - 5, htf_liq_high_1, bar_index + i_htf_liq_ext, htf_liq_high_1, xloc=xloc.bar_index, color=color.new(color.yellow, 0), width=1, style=line.style_dotted)
+        f_track_line(htf_liq_ln1_high)
+    if not na(htf_liq_low_1)
+        if not na(htf_liq_ln1_low)
+            line.delete(htf_liq_ln1_low)
+        htf_liq_ln1_low := line.new(bar_index - 5, htf_liq_low_1, bar_index + i_htf_liq_ext, htf_liq_low_1, xloc=xloc.bar_index, color=color.new(color.yellow, 0), width=1, style=line.style_dotted)
+        f_track_line(htf_liq_ln1_low)
+    if not na(htf_liq_high_2)
+        if not na(htf_liq_ln2_high)
+            line.delete(htf_liq_ln2_high)
+        htf_liq_ln2_high := line.new(bar_index - 5, htf_liq_high_2, bar_index + i_htf_liq_ext, htf_liq_high_2, xloc=xloc.bar_index, color=color.new(color.orange, 0), width=2, style=line.style_dotted)
+        f_track_line(htf_liq_ln2_high)
+    if not na(htf_liq_low_2)
+        if not na(htf_liq_ln2_low)
+            line.delete(htf_liq_ln2_low)
+        htf_liq_ln2_low := line.new(bar_index - 5, htf_liq_low_2, bar_index + i_htf_liq_ext, htf_liq_low_2, xloc=xloc.bar_index, color=color.new(color.orange, 0), width=2, style=line.style_dotted)
+        f_track_line(htf_liq_ln2_low)
+
+if not na(htf_liq_ln1_high)
+    line.set_x2(htf_liq_ln1_high, bar_index + i_htf_liq_ext)
+if not na(htf_liq_ln1_low)
+    line.set_x2(htf_liq_ln1_low, bar_index + i_htf_liq_ext)
+if not na(htf_liq_ln2_high)
+    line.set_x2(htf_liq_ln2_high, bar_index + i_htf_liq_ext)
+if not na(htf_liq_ln2_low)
+    line.set_x2(htf_liq_ln2_low, bar_index + i_htf_liq_ext)
+
+// ========== HTF FVG (overlay) ==========
+i_htf_fvg_enabled = input.bool(false, "Enable HTF FVG overlay", group="HTF FVG")
+i_htf_fvg_tf = input.timeframe("240", "HTF FVG timeframe", group="HTF FVG")
+i_htf_fvg_min_atr = input.float(0.0, "HTF FVG min size (%ATR HTF)", 0.0, group="HTF FVG")
+i_htf_fvg_ext = input.int(60, "HTF FVG extension (bars)", 1, group="HTF FVG")
+
+htf_low   = i_htf_fvg_enabled ? request.security(syminfo.tickerid, i_htf_fvg_tf, low)  : na
+htf_high  = i_htf_fvg_enabled ? request.security(syminfo.tickerid, i_htf_fvg_tf, high) : na
+htf_atr   = i_htf_fvg_enabled ? request.security(syminfo.tickerid, i_htf_fvg_tf, ta.atr(14)) : na
+
+var box htf_fvg_box_last = na
+var bool htf_fvg_is_bull = false
+
+htf_fvg_bull = i_htf_fvg_enabled and not na(htf_low) and not na(htf_high[2]) and (htf_low > htf_high[2]) and (htf_low - htf_high[2] >= htf_atr * i_htf_fvg_min_atr)
+htf_fvg_bear = i_htf_fvg_enabled and not na(htf_high) and not na(htf_low[2])  and (htf_high < htf_low[2]) and (htf_low[2] - htf_high >= htf_atr * i_htf_fvg_min_atr)
+
+if i_htf_fvg_enabled and barstate.isconfirmed
+    if htf_fvg_bull
+        if not na(htf_fvg_box_last)
+            box.delete(htf_fvg_box_last)
+        c = color.new(color.green, 90)
+        htf_fvg_box_last := box.new(bar_index - 2, htf_low, bar_index + i_htf_fvg_ext, htf_high[2], xloc=xloc.bar_index, border_color=color.new(color.green, 0), bgcolor=c)
+        f_track_box(htf_fvg_box_last)
+        htf_fvg_is_bull := true
+    if htf_fvg_bear
+        if not na(htf_fvg_box_last)
+            box.delete(htf_fvg_box_last)
+        c = color.new(color.red, 90)
+        htf_fvg_box_last := box.new(bar_index - 2, htf_low[2], bar_index + i_htf_fvg_ext, htf_high, xloc=xloc.bar_index, border_color=color.new(color.red, 0), bgcolor=c)
+        f_track_box(htf_fvg_box_last)
+        htf_fvg_is_bull := false
+
+if not na(htf_fvg_box_last)
+    box.set_right(htf_fvg_box_last, bar_index + i_htf_fvg_ext)
+
+// ========== RISK + EXECUTION (partial exits + breakeven) ==========
+i_stop_mult = input.float(1.5, "ATR Stop mult", 0.5, group="Risk")
+i_tp2_mult  = input.float(3.0, "ATR Target mult (TP2)", 1.0, group="Risk")
+i_tp1_mult  = input.float(1.5, "ATR Target mult (TP1)", 0.5, group="Risk")
+i_split_pct = input.float(50.0, "Exit split % (each leg)", 10.0, 90.0, group="Risk")
+
+sl_long   = close - atr * i_stop_mult
+sl_short  = close + atr * i_stop_mult
+tp1_long  = close + atr * i_tp1_mult
+tp2_long  = close + atr * i_tp2_mult
+tp1_short = close - atr * i_tp1_mult
+tp2_short = close - atr * i_tp2_mult
+
+// Classic ICT: Entry on 50% midline touch in FVG/OB zones
+bool fvg_mid_touch = false
+bool ob_mid_touch  = false
+bool zone_touch = false
+
+if array.size(FVGs) > 0
+    for i = 0 to array.size(FVGs) - 1
+        fvg = array.get(FVGs, i)
+        mid = (fvg.top + fvg.bottom) * 0.5
+        // Classic ICT: Enter when price touches 50% of FVG
+        if fvg.bull and low <= mid and high >= fvg.bottom
+            fvg_mid_touch := true
+            if not fvg.tested
+                fvg.tested := true
+                array.set(FVGs, i, fvg)
+        if not fvg.bull and high >= mid and low <= fvg.top
+            fvg_mid_touch := true
+            if not fvg.tested
+                fvg.tested := true
+                array.set(FVGs, i, fvg)
+        // Also check for any zone touch
+        if low <= fvg.top and high >= fvg.bottom
+            zone_touch := true
+
+if array.size(OBs) > 0
+    for i = 0 to array.size(OBs) - 1
+        ob = array.get(OBs, i)
+        mid = (ob.top + ob.bottom) * 0.5
+        // Classic ICT: Enter when price reaches 50% of OB
+        if ob.bull and low <= mid and high >= ob.bottom
+            ob_mid_touch := true
+        if not ob.bull and high >= mid and low <= ob.top
+            ob_mid_touch := true
+        // Also check for any zone touch
+        if low <= ob.top and high >= ob.bottom
+            zone_touch := true
+
+// Check for liquidity sweep (recent sweep within last 20 bars - increased from 5)
+bool recent_liq_sweep_bull = false
+bool recent_liq_sweep_bear = false
+// Also check for liquidity DRAW (price approaching liquidity)
+bool liq_draw_bull = false
+bool liq_draw_bear = false
+
+if array.size(LIQs) > 0
+    for i = 0 to math.min(array.size(LIQs) - 1, 9)  // Check up to 10 recent liquidity pools
+        liq = array.get(LIQs, i)
+        bars_since = bar_index - liq.start_idx
+        dist = math.abs(close - liq.level)
+        
+        // Swept within last 20 bars
+        if bars_since <= 20
+            if not liq.is_high  // Low swept = bullish
+                recent_liq_sweep_bull := true
+            else  // High swept = bearish
+                recent_liq_sweep_bear := true
+        
+        // Or drawing towards liquidity (within 2 ATR)
+        if dist <= atr * 2.0
+            if liq.is_high  // Approaching high = bearish draw
+                liq_draw_bear := true
+            else  // Approaching low = bullish draw
+                liq_draw_bull := true
+
+// Entry conditions based on model
+long_cond = false
+short_cond = false
+
+if i_entry_model == "NQ Institutional"
+    // NQ Institutional: Optimized for E-mini Nasdaq-100 and equity indices
+    // - Prioritizes Order Blocks over FVG (institutional footprint)
+    // - Daily HTF structure (D 50MA) instead of dual intraday
+    // - Session filter (NY open 09:30-12:00 ET for max volume)
+    // - Faster confirmation (1-2 bars vs 2-3)
+    // - NO liquidity requirement (index sweeps are subtle)
+    // - Lower confluence for more trades (35% default)
+    
+    // OB priority: OB alone sufficient, FVG is bonus
+    ob_priority = ob_mid_touch or (fvg_mid_touch and ob_mid_touch)
+    
+    // Daily structure overrides intraday noise
+    daily_aligned_bull = htf_daily_bull and (current_trend == "bullish" or current_trend == "neutral")
+    daily_aligned_bear = htf_daily_bear and (current_trend == "bearish" or current_trend == "neutral")
+    
+    // Session filter: If enabled and session closed, don't trade (strict for indices)
+    // If session filter OFF, always allow (for 24h testing)
+    session_ok = not i_session_filter or in_session
+    
+    long_cond  := ob_priority and daily_aligned_bull and conf_score >= 35 and stable_dir == "long" and session_ok and in_date_range and (i_dir == "Long" or i_dir == "Both")
+    short_cond := ob_priority and daily_aligned_bear and conf_score >= 35 and stable_dir == "short" and session_ok and in_date_range and (i_dir == "Short" or i_dir == "Both")
+
+else if i_entry_model == "Silver Bullet"
+    // Silver Bullet: FVG/OB 50% + Liquidity sweep/draw + HTF bias + confluence
+    // Improved: Accepts both swept liquidity (within 20 bars) OR liquidity draw (within 2 ATR)
+    // Adaptive: Stocks/indices don't require liquidity component (less liquid), crypto/forex do
+    // Best during London/NY killzones (03:00-05:00 & 08:00-11:00 EST)
+    
+    liq_requirement_bull = (is_stocks or is_indices) ? true : (recent_liq_sweep_bull or liq_draw_bull)
+    liq_requirement_bear = (is_stocks or is_indices) ? true : (recent_liq_sweep_bear or liq_draw_bear)
+    
+    long_cond  := (fvg_mid_touch or ob_mid_touch) and liq_requirement_bull and htf_bias_bull and conf_score >= i_conf_thr and stable_dir == "long" and in_date_range and (i_dir == "Long" or i_dir == "Both")
+    short_cond := (fvg_mid_touch or ob_mid_touch) and liq_requirement_bear and htf_bias_bear and conf_score >= i_conf_thr and stable_dir == "short" and in_date_range and (i_dir == "Short" or i_dir == "Both")
+
+else if i_entry_model == "Unicorn"
+    // Unicorn: Deep FVG retest (lower 25% for bull, upper 25% for bear) + strong confluence
+    // Rare but high probability setup
+    bool fvg_deep_bull = false
+    bool fvg_deep_bear = false
+    if array.size(FVGs) > 0
+        for i = 0 to array.size(FVGs) - 1
+            fvg = array.get(FVGs, i)
+            fvg_range = fvg.top - fvg.bottom
+            lower_25 = fvg.bottom + fvg_range * 0.25
+            upper_75 = fvg.bottom + fvg_range * 0.75
+            if fvg.bull and low <= lower_25 and high >= fvg.bottom
+                fvg_deep_bull := true
+            if not fvg.bull and high >= upper_75 and low <= fvg.top
+                fvg_deep_bear := true
+    
+    long_cond  := fvg_deep_bull and conf_score >= 70 and htf_bias_bull and stable_dir == "long" and in_date_range and (i_dir == "Long" or i_dir == "Both")
+    short_cond := fvg_deep_bear and conf_score >= 70 and htf_bias_bear and stable_dir == "short" and in_date_range and (i_dir == "Short" or i_dir == "Both")
+
+else if i_entry_model == "Turtle Soup"
+    // Turtle Soup: Failed breakout (fake BOS) + price returns to OB/FVG
+    // Looks for stop hunts that fail
+    bool failed_breakout_bull = false
+    bool failed_breakout_bear = false
+    
+    // Check if recent high was taken but price reversed back
+    if high[1] > high[2] and high[1] > high[3] and close < open  // Failed bull breakout
+        failed_breakout_bear := true
+    if low[1] < low[2] and low[1] < low[3] and close > open  // Failed bear breakout
+        failed_breakout_bull := true
+    
+    long_cond  := failed_breakout_bull and (ob_mid_touch or fvg_mid_touch) and conf_score >= 50 and stable_dir == "long" and in_date_range and (i_dir == "Long" or i_dir == "Both")
+    short_cond := failed_breakout_bear and (ob_mid_touch or fvg_mid_touch) and conf_score >= 50 and stable_dir == "short" and in_date_range and (i_dir == "Short" or i_dir == "Both")
+
+else if i_entry_model == "Classic ICT"
+    // Classic: 50% zone + confluence + trend alignment
+    long_cond  := (fvg_mid_touch or ob_mid_touch) and conf_score >= i_conf_thr and stable_dir == "long" and in_date_range and (i_dir == "Long" or i_dir == "Both")
+    short_cond := (fvg_mid_touch or ob_mid_touch) and conf_score >= i_conf_thr and stable_dir == "short" and in_date_range and (i_dir == "Short" or i_dir == "Both")
+
+else  // Aggressive
+    // Aggressive: Any zone touch + lower confluence
+    long_cond  := zone_touch and conf_score >= 35 and conf_dir == "long" and in_date_range and (i_dir == "Long" or i_dir == "Both")
+    short_cond := zone_touch and conf_score >= 35 and conf_dir == "short" and in_date_range and (i_dir == "Short" or i_dir == "Both")
+
+// Debug plots to see signal components
+plot(conf_score, "Confluence Score", color=color.blue, display=display.data_window)
+plot(stable_dir == "long" ? 1 : stable_dir == "short" ? -1 : 0, "Stable Dir", display=display.data_window)
+plot(fvg_mid_touch ? 1 : 0, "FVG 50% Touch", display=display.data_window)
+plot(ob_mid_touch ? 1 : 0, "OB 50% Touch", display=display.data_window)
+plot(zone_touch ? 1 : 0, "Zone Touch", display=display.data_window)
+
+// Track actual entry execution
+var bool entry_executed_long = false
+var bool entry_executed_short = false
+
+// Single entry; two exits with qty_percent for partials
+if long_cond and strategy.position_size == 0
+    strategy.entry("Long", strategy.long)
+    entry_executed_long := true
+else
+    entry_executed_long := false
+    
+if short_cond and strategy.position_size == 0
+    strategy.entry("Short", strategy.short)
+    entry_executed_short := true
+else
+    entry_executed_short := false
+
+// Breakeven after TP1 hit
+long_tp1_hit  = strategy.position_size > 0 and high >= tp1_long
+short_tp1_hit = strategy.position_size < 0 and low <= tp1_short
+entry_price   = strategy.position_avg_price
+
+strategy.exit("Long TP1",  "Long", qty_percent=i_split_pct, stop=sl_long, limit=tp1_long)
+strategy.exit("Long TP2",  "Long", qty_percent=i_split_pct, stop=(long_tp1_hit ? entry_price : sl_long), limit=tp2_long)
+
+strategy.exit("Short TP1", "Short", qty_percent=i_split_pct, stop=sl_short, limit=tp1_short)
+strategy.exit("Short TP2", "Short", qty_percent=i_split_pct, stop=(short_tp1_hit ? entry_price : sl_short), limit=tp2_short)
+
+// ONLY plot shapes when actual trade entry happens (not just conditions met)
+plotshape(entry_executed_long,  "Long Entry",  shape.triangleup,   location.belowbar, color.new(color.green, 0), size=size.normal, text="LONG")
+plotshape(entry_executed_short, "Short Entry", shape.triangledown, location.abovebar, color.new(color.red, 0),   size=size.normal, text="SHORT")
+
+// ========== RESET OBJECTS ONLY ==========
+f_delete_all_objects() =>
+    // Clear module objects
+    if array.size(OBs) > 0
+        for i = array.size(OBs) - 1 to 0
+            box.delete(array.get(OBs, i).box_id)
+        array.clear(OBs)
+
+    if array.size(FVGs) > 0
+        for i = array.size(FVGs) - 1 to 0
+            box.delete(array.get(FVGs, i).box_id)
+        array.clear(FVGs)
+
+    if array.size(LIQs) > 0
+        for i = array.size(LIQs) - 1 to 0
+            liq = array.get(LIQs, i)
+            line.delete(liq.line_id)
+            if not na(liq.label_id)
+                label.delete(liq.label_id)
+        array.clear(LIQs)
+
+    if array.size(BOSs) > 0
+        for i = array.size(BOSs) - 1 to 0
+            bos = array.get(BOSs, i)
+            line.delete(bos.line_id)
+            label.delete(bos.label_id)
+        array.clear(BOSs)
+
+    // Po3 and HTF visuals
+    if not na(PO3.target_line)
+        line.delete(PO3.target_line)
+    if not na(PO3.label_id)
+        label.delete(PO3.label_id)
+
+    if not na(htf_liq_ln1_high)
+        line.delete(htf_liq_ln1_high)
+    if not na(htf_liq_ln1_low)
+        line.delete(htf_liq_ln1_low)
+    if not na(htf_liq_ln2_high)
+        line.delete(htf_liq_ln2_high)
+    if not na(htf_liq_ln2_low)
+        line.delete(htf_liq_ln2_low)
+    if not na(htf_fvg_box_last)
+        box.delete(htf_fvg_box_last)
+
+if barstate.isfirst or needs_reset
+    f_delete_all_objects()
+    // Reset globals OUTSIDE function
+    PO3 := Po3Phase.new("accumulation", na, na, na, na, na, na, na)
+    po3_active := false
+    current_trend := "neutral"
+
+    htf_liq_ln1_high := na
+    htf_liq_ln1_low  := na
+    htf_liq_ln2_high := na
+    htf_liq_ln2_low  := na
+    htf_fvg_box_last := na
+
+    needs_reset := false
+
+// ========== PERFORMANCE (Data Window) ==========
+total_trades = strategy.closedtrades
+win_rate = total_trades > 0 ? strategy.wintrades / total_trades * 100 : 0.0
+profit_factor = strategy.grossloss > 0 ? strategy.grossprofit / strategy.grossloss : 0.0
+avg_win = strategy.wintrades > 0 ? strategy.grossprofit / strategy.wintrades : 0.0
+avg_loss = strategy.losstrades > 0 ? strategy.grossloss / strategy.losstrades : 0.0
+rr_ratio = avg_loss > 0 ? avg_win / avg_loss : 0.0
+expectancy = (win_rate / 100.0 * avg_win) - ((1.0 - win_rate / 100.0) * avg_loss)
+
+plot(total_trades, "Total Trades", display=display.data_window)
+plot(win_rate, "Win Rate %", display=display.data_window)
+plot(profit_factor, "Profit Factor", display=display.data_window)
+plot(rr_ratio, "RR Ratio", display=display.data_window)
+plot(expectancy, "Expectancy", display=display.data_window)

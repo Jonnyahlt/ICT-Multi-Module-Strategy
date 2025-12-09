@@ -1,56 +1,74 @@
 //@version=6
-strategy("ICT Multi-Module Strategy [BACKTEST]", overlay=true, 
-         initial_capital=10000, 
-         default_qty_type=strategy.percent_of_equity, 
-         default_qty_value=100,
-         commission_type=strategy.commission.percent, 
-         commission_value=0.1,
-         slippage=2,
-         max_boxes_count=500, 
-         max_lines_count=500)
+indicator("ICT Multi-Module Strategy [Refactored]", overlay=true, max_boxes_count=500, max_lines_count=500, max_labels_count=500)
 
 // ============================================================================
-// BACKTEST SETTINGS
+// GLOBAL SETTINGS & HTF CONFIGURATION
 // ============================================================================
-i_start_date = input.time(timestamp("2020-01-01 00:00"), "Start Date", group="Backtest")
-i_end_date = input.time(timestamp("2099-12-31 23:59"), "End Date", group="Backtest")
-i_trade_direction = input.string("Both", "Trade Direction", options=["Long", "Short", "Both"], group="Backtest")
+// Module visibility
+i_show_ob = input.bool(true, "Show Order Blocks", group="Modules")
+i_show_fvg = input.bool(true, "Show Fair Value Gaps", group="Modules")
+i_show_bos = input.bool(true, "Show Break of Structure", group="Modules")
+i_show_liquidity = input.bool(true, "Show Liquidity Pools", group="Modules")
+i_show_po3 = input.bool(true, "Show Po3 Phases", group="Modules")
+i_show_confluence = input.bool(true, "Show Confluence Signals", group="Modules")
 
-// Date filter
-in_date_range = true
+// HTF settings
+i_htf1 = input.timeframe("60", "HTF 1", group="Higher Timeframes")
+i_htf2 = input.timeframe("240", "HTF 2", group="Higher Timeframes")
+i_htf3 = input.timeframe("D", "HTF 3", group="Higher Timeframes")
+i_use_htf = input.bool(true, "Enable HTF Analysis", group="Higher Timeframes")
+
+// Zone extensions (finite, bar_index based)
+i_ob_extension = input.int(20, "OB Zone Extension", minval=1, maxval=100, group="Zone Extensions")
+i_fvg_extension = input.int(30, "FVG Zone Extension", minval=1, maxval=100, group="Zone Extensions")
+i_bos_extension = input.int(15, "BOS Line Extension", minval=1, maxval=100, group="Zone Extensions")
+i_liq_extension = input.int(25, "Liquidity Extension", minval=1, maxval=100, group="Zone Extensions")
+i_po3_extension = input.int(30, "Po3 Target Extension", minval=1, maxval=100, group="Zone Extensions")
+
+// Max zones per module
+i_max_ob = input.int(5, "Max OB Zones", minval=1, maxval=20, group="Zone Limits")
+i_max_fvg = input.int(3, "Max FVG Zones", minval=1, maxval=20, group="Zone Limits")
+i_max_liq = input.int(5, "Max Liquidity Levels", minval=1, maxval=20, group="Zone Limits")
+
+// Invalidation modes
+i_ob_invalidate = input.string("close_beyond", "OB Invalidation", options=["close_beyond", "full_break", "midpoint"], group="Invalidation")
+i_fvg_invalidate = input.string("full_fill", "FVG Invalidation", options=["full_fill", "close_inside", "midpoint"], group="Invalidation")
+i_max_retests = input.int(3, "Max Retests Before Invalid", minval=1, maxval=10, group="Invalidation")
+
+// Alert controls
+i_alert_ob = input.bool(true, "Alert: OB Touch", group="Alerts")
+i_alert_fvg = input.bool(true, "Alert: FVG First Test", group="Alerts")
+i_alert_liq_ltf = input.bool(true, "Alert: LTF Sweep", group="Alerts")
+i_alert_liq_htf = input.bool(true, "Alert: HTF Sweep", group="Alerts")
+i_alert_confluence = input.bool(true, "Alert: High Confidence", group="Alerts")
+i_sweep_window = input.int(3, "Sweep Window (bars)", minval=1, maxval=10, group="Alerts")
 
 // ============================================================================
-// GLOBAL SETTINGS
+// MODULE 1: ORDER BLOCK DETECTOR (ICT Standard)
 // ============================================================================
-i_show_ob = input.bool(true, "Show Order Blocks", group="Global Settings")
-i_show_fvg = input.bool(true, "Show Fair Value Gaps", group="Global Settings")
-i_show_bos = input.bool(true, "Show Break of Structure", group="Global Settings")
-i_show_liquidity = input.bool(true, "Show Liquidity Pools", group="Global Settings")
-i_show_po3 = input.bool(true, "Show Po3 Phases", group="Global Settings")
-i_show_confluence = input.bool(true, "Show Confluence Signals", group="Global Settings")
+// OB = Last opposing candle before engulf + BOS confirmation
+// Strength = normalized score: body vs ATR, wick ratio, volume, BOS follow-through
 
-// Max Zones Limiter
-i_max_ob_zones = input.int(5, "Max OB Zones", minval=1, maxval=20, group="Visual Limits")
-i_max_fvg_zones = input.int(3, "Max FVG Zones", minval=1, maxval=20, group="Visual Limits")
-i_max_liq_zones = input.int(5, "Max Liquidity Zones", minval=1, maxval=20, group="Visual Limits")
+// --- Input Parameters ---
+i_ob_lookback = input.int(10, "OB Lookback", minval=3, group="Order Block")
+i_ob_wick_max = input.float(0.3, "Max Wick Ratio", minval=0.0, maxval=1.0, group="Order Block")
+i_ob_min_body = input.float(0.3, "Min Body vs ATR", minval=0.1, group="Order Block")
+i_ob_volume_mult = input.float(1.2, "Volume vs SMA", minval=0.5, group="Order Block")
+i_ob_require_bos = input.bool(true, "Require BOS Confirmation", group="Order Block")
 
-// ============================================================================
-// MODULE 1: ORDER BLOCK DETECTOR
-// ============================================================================
-i_ob_lookback = input.int(10, "Lookback Period", minval=1, group="Order Block")
-i_ob_wick_threshold = input.float(0.3, "Wick Threshold Ratio", minval=0.0, maxval=1.0, group="Order Block")
-i_ob_zone_extension = input.int(20, "Zone Extension (Candles)", minval=1, group="Order Block")
-
+// --- Standardized OB Model ---
 type OrderBlock
-    float top
-    float bottom
-    int strength
-    bool is_bullish
-    int bar_index
+    int id, int start_idx, int end_idx
+    float top, float bottom
+    bool is_bullish, bool alerted, bool invalidated
+    float strength  // 0.0-1.0 normalized
+    int retest_count
     box box_id
 
 var array<OrderBlock> active_obs = array.new<OrderBlock>()
+var int ob_id_counter = 0
 
+// Calculate Order Block strength
 f_ob_strength(float body_size, float wick_ratio, float volume_ratio) =>
     score = 0
     if body_size > ta.atr(14) * 0.5
@@ -61,6 +79,7 @@ f_ob_strength(float body_size, float wick_ratio, float volume_ratio) =>
         score += 1
     score
 
+// Detect bullish Order Block (last down candle before bullish engulfing)
 f_detect_bullish_ob() =>
     is_ob = false
     ob_top = 0.0
@@ -69,7 +88,9 @@ f_detect_bullish_ob() =>
     
     volume_sma = ta.sma(volume, 20)
     
+    // Check for bullish engulfing
     if close > open and close[0] > open[1] and open[0] < close[1]
+        // Previous candle is down candle (potential OB)
         if close[1] < open[1]
             body_size = open[1] - close[1]
             lower_wick = close[1] - low[1]
@@ -84,6 +105,7 @@ f_detect_bullish_ob() =>
     
     [is_ob, ob_top, ob_bottom, strength]
 
+// Detect bearish Order Block (last up candle before bearish engulfing)
 f_detect_bearish_ob() =>
     is_ob = false
     ob_top = 0.0
@@ -92,7 +114,9 @@ f_detect_bearish_ob() =>
     
     volume_sma = ta.sma(volume, 20)
     
+    // Check for bearish engulfing
     if close < open and close[0] < open[1] and open[0] > close[1]
+        // Previous candle is up candle (potential OB)
         if close[1] > open[1]
             body_size = close[1] - open[1]
             upper_wick = high[1] - close[1]
@@ -107,34 +131,47 @@ f_detect_bearish_ob() =>
     
     [is_ob, ob_top, ob_bottom, strength]
 
+// --- Zone Drawing and Management ---
 if i_show_ob
+    // Detect and draw bullish OBs
     [is_bullish_ob, bull_top, bull_bottom, bull_strength] = f_detect_bullish_ob()
     if is_bullish_ob
+        // Limit max zones
         if array.size(active_obs) >= i_max_ob_zones
             oldest_ob = array.shift(active_obs)
             box.delete(oldest_ob.box_id)
         
         ob_color = bull_strength == 3 ? color.new(color.green, 80) : bull_strength == 2 ? color.new(color.green, 85) : color.new(color.green, 90)
-        box_id = box.new(bar_index - 1, bull_top, bar_index + i_ob_zone_extension, bull_bottom, 
-                         border_color=color.green, bgcolor=ob_color, 
+        box_id = box.new(time[1], bull_top, time, bull_bottom, xloc=xloc.bar_time, 
+                         border_color=color.green, bgcolor=ob_color, extend=extend.right, 
                          text="OB+" + str.tostring(bull_strength), text_size=size.small)
         array.push(active_obs, OrderBlock.new(bull_top, bull_bottom, bull_strength, true, bar_index - 1, box_id))
     
+    // Detect and draw bearish OBs
     [is_bearish_ob, bear_top, bear_bottom, bear_strength] = f_detect_bearish_ob()
     if is_bearish_ob
+        // Limit max zones
         if array.size(active_obs) >= i_max_ob_zones
             oldest_ob = array.shift(active_obs)
             box.delete(oldest_ob.box_id)
         
         ob_color = bear_strength == 3 ? color.new(color.red, 80) : bear_strength == 2 ? color.new(color.red, 85) : color.new(color.red, 90)
-        box_id = box.new(bar_index - 1, bear_top, bar_index + i_ob_zone_extension, bear_bottom, 
-                         border_color=color.red, bgcolor=ob_color, 
+        box_id = box.new(time[1], bear_top, time, bear_bottom, xloc=xloc.bar_time, 
+                         border_color=color.red, bgcolor=ob_color, extend=extend.right, 
                          text="OB-" + str.tostring(bear_strength), text_size=size.small)
         array.push(active_obs, OrderBlock.new(bear_top, bear_bottom, bear_strength, false, bar_index - 1, box_id))
     
+    // Test and invalidate OBs
     if array.size(active_obs) > 0
         for i = array.size(active_obs) - 1 to 0
             ob = array.get(active_obs, i)
+            
+            // Alert on OB touch
+            is_touching = (low <= ob.top and high >= ob.bottom)
+            if is_touching and i_alert_ob
+                alert("Order Block " + (ob.is_bullish ? "Bullish" : "Bearish") + " touched at " + str.tostring(close), alert.freq_once_per_bar)
+            
+            // Invalidate broken OBs
             is_broken = ob.is_bullish ? low < ob.bottom : high > ob.top
             if is_broken
                 box.delete(ob.box_id)
@@ -143,9 +180,20 @@ if i_show_ob
 // ============================================================================
 // MODULE 2: FAIR VALUE GAP FINDER
 // ============================================================================
+// FVG Definition:
+// - 3-candle pattern where candle[1] leaves gap between candle[0] and candle[2]
+// - Measured between wicks AND bodies
+// - If price gaps completely, include full gap in FVG zone
+
+// --- Input Parameters ---
 i_fvg_min_size = input.float(0.0, "Minimum Gap Size (% ATR)", minval=0.0, group="Fair Value Gap")
+i_fvg_wick_threshold = input.float(0.25, "Wick Threshold Ratio", minval=0.0, maxval=1.0, group="Fair Value Gap")
+i_fvg_mtf_enabled = input.bool(true, "Enable Multi-Timeframe", group="Fair Value Gap")
+i_fvg_htf = input.timeframe("60", "Higher Timeframe", group="Fair Value Gap")
+i_fvg_htf2 = input.timeframe("240", "Higher Timeframe 2", group="Fair Value Gap")
 i_fvg_zone_extension = input.int(30, "Zone Extension (Candles)", minval=1, group="Fair Value Gap")
 
+// --- Detection Logic ---
 type FairValueGap
     float top
     float bottom
@@ -156,6 +204,7 @@ type FairValueGap
 
 var array<FairValueGap> active_fvgs = array.new<FairValueGap>()
 
+// Detect bullish FVG (gap up)
 f_detect_bullish_fvg() =>
     is_fvg = false
     fvg_top = 0.0
@@ -163,12 +212,17 @@ f_detect_bullish_fvg() =>
     
     atr_value = ta.atr(14)
     
-    gap_bottom = high[2]
-    gap_top = low[0]
+    // Bullish FVG: 3-candle pattern moving UP
+    // Gap between high of candle[2] and low of candle[0]
+    // Candle[1] should NOT fill this gap (leave FVG zone)
+    gap_bottom = high[2]  // Top of first (old) candle
+    gap_top = low[0]       // Bottom of third (current) candle
     
+    // Check if there's actually a gap (no overlap)
     if gap_top > gap_bottom
         gap_size = gap_top - gap_bottom
         
+        // Verify gap size meets minimum threshold
         if gap_size >= atr_value * i_fvg_min_size
             is_fvg := true
             fvg_top := gap_top
@@ -176,6 +230,7 @@ f_detect_bullish_fvg() =>
     
     [is_fvg, fvg_top, fvg_bottom]
 
+// Detect bearish FVG (gap down)
 f_detect_bearish_fvg() =>
     is_fvg = false
     fvg_top = 0.0
@@ -183,12 +238,17 @@ f_detect_bearish_fvg() =>
     
     atr_value = ta.atr(14)
     
-    gap_top = low[2]
-    gap_bottom = high[0]
+    // Bearish FVG: 3-candle pattern moving DOWN
+    // Gap between low of candle[2] and high of candle[0]
+    // Candle[1] should NOT fill this gap (leave FVG zone)
+    gap_top = low[2]       // Bottom of first (old) candle
+    gap_bottom = high[0]   // Top of third (current) candle
     
+    // Check if there's actually a gap (no overlap)
     if gap_top > gap_bottom
         gap_size = gap_top - gap_bottom
         
+        // Verify gap size meets minimum threshold
         if gap_size >= atr_value * i_fvg_min_size
             is_fvg := true
             fvg_top := gap_top
@@ -196,49 +256,79 @@ f_detect_bearish_fvg() =>
     
     [is_fvg, fvg_top, fvg_bottom]
 
+// --- Zone Drawing and Management ---
 if i_show_fvg
+    // Detect and draw bullish FVGs
     [is_bull_fvg, bull_fvg_top, bull_fvg_bottom] = f_detect_bullish_fvg()
     if is_bull_fvg
+        // Limit max zones
         if array.size(active_fvgs) >= i_max_fvg_zones
             oldest_fvg = array.shift(active_fvgs)
             box.delete(oldest_fvg.box_id)
         
         fvg_color = color.new(color.green, 85)
-        box_id = box.new(bar_index - 1, bull_fvg_top, bar_index + i_fvg_zone_extension, bull_fvg_bottom,
-                         border_color=color.green, bgcolor=fvg_color, border_style=line.style_dashed,
+        box_id = box.new(time[1], bull_fvg_top, time, bull_fvg_bottom, xloc=xloc.bar_time,
+                         border_color=color.green, bgcolor=fvg_color, border_style=line.style_dashed, extend=extend.right,
                          text="FVG↑", text_size=size.small)
         array.push(active_fvgs, FairValueGap.new(bull_fvg_top, bull_fvg_bottom, true, bar_index - 1, box_id, false))
     
+    // Detect and draw bearish FVGs
     [is_bear_fvg, bear_fvg_top, bear_fvg_bottom] = f_detect_bearish_fvg()
     if is_bear_fvg
+        // Limit max zones
         if array.size(active_fvgs) >= i_max_fvg_zones
             oldest_fvg = array.shift(active_fvgs)
             box.delete(oldest_fvg.box_id)
         
         fvg_color = color.new(color.red, 85)
-        box_id = box.new(bar_index - 1, bear_fvg_top, bar_index + i_fvg_zone_extension, bear_fvg_bottom,
-                         border_color=color.red, bgcolor=fvg_color, border_style=line.style_dashed,
+        box_id = box.new(time[1], bear_fvg_top, time, bear_fvg_bottom, xloc=xloc.bar_time,
+                         border_color=color.red, bgcolor=fvg_color, border_style=line.style_dashed, extend=extend.right,
                          text="FVG↓", text_size=size.small)
         array.push(active_fvgs, FairValueGap.new(bear_fvg_top, bear_fvg_bottom, false, bar_index - 1, box_id, false))
     
+    // Test and invalidate filled FVGs
     if array.size(active_fvgs) > 0
         for i = array.size(active_fvgs) - 1 to 0
             fvg = array.get(active_fvgs, i)
+            
+            // Check if FVG is tested for first time (alert)
+            is_tested = fvg.is_bullish ? (low <= fvg.top and high >= fvg.bottom) : (high >= fvg.bottom and low <= fvg.top)
+            if is_tested and not fvg.alerted and i_alert_fvg
+                alert("FVG " + (fvg.is_bullish ? "Bullish" : "Bearish") + " tested at " + str.tostring(close), alert.freq_once_per_bar)
+                fvg.alerted := true
+                array.set(active_fvgs, i, fvg)
+            
+            // Check if FVG is completely filled (invalidate)
             is_filled = fvg.is_bullish ? close < fvg.bottom : close > fvg.top
             if is_filled
                 box.delete(fvg.box_id)
                 array.remove(active_fvgs, i)
 
 // ============================================================================
-// MODULE 3: BREAK OF STRUCTURE
+// MODULE 3: BREAK OF STRUCTURE (BOS) + MARKET STRUCTURE SHIFT
 // ============================================================================
+// BOS Definition:
+// - Price breaks most recent swing high (bullish) or low (bearish)
+// - Minimum movement threshold required
+// - Volume confirmation filter
+
+// --- Input Parameters ---
 i_bos_lookback = input.int(10, "Swing Lookback", minval=5, group="Break of Structure")
 i_bos_min_move = input.float(0.5, "Minimum Move (%)", minval=0.1, group="Break of Structure")
 i_bos_volume_filter = input.bool(true, "Enable Volume Filter", group="Break of Structure")
 i_bos_volume_threshold = input.float(1.2, "Volume Threshold (vs MA)", minval=1.0, group="Break of Structure")
 
+// --- Detection Logic ---
+type StructureBreak
+    float level
+    bool is_bullish
+    int bar_index
+    line line_id
+
+var array<StructureBreak> structure_breaks = array.new<StructureBreak>()
 var string current_trend = "neutral"
 
+// Find swing high
 f_swing_high(int lookback) =>
     highest = high[lookback]
     is_swing = true
@@ -252,6 +342,7 @@ f_swing_high(int lookback) =>
             break
     is_swing ? highest : na
 
+// Find swing low
 f_swing_low(int lookback) =>
     lowest = low[lookback]
     is_swing = true
@@ -265,39 +356,54 @@ f_swing_low(int lookback) =>
             break
     is_swing ? lowest : na
 
+// --- BOS Detection and Visualization ---
 if i_show_bos
     swing_high = f_swing_high(i_bos_lookback)
     swing_low = f_swing_low(i_bos_lookback)
     volume_sma = ta.sma(volume, 20)
     
+    // Bullish BOS (break above swing high)
     if not na(swing_high) and close > swing_high
         move_pct = ((close - swing_high) / swing_high) * 100
         volume_ok = not i_bos_volume_filter or volume > volume_sma * i_bos_volume_threshold
         
         if move_pct >= i_bos_min_move and volume_ok
-            line.new(bar_index - i_bos_lookback, swing_high, bar_index, swing_high,
-                    color=color.green, width=2, style=line.style_solid)
-            label.new(bar_index, swing_high, "BOS↑", color=color.green, textcolor=color.white, 
+            line_id = line.new(time[i_bos_lookback], swing_high, time, swing_high, xloc=xloc.bar_time,
+                              color=color.green, width=2, style=line.style_solid)
+            label.new(time, swing_high, "BOS↑", xloc=xloc.bar_time, color=color.green, textcolor=color.white, 
                      style=label.style_label_up, size=size.small)
             current_trend := "bullish"
+            array.push(structure_breaks, StructureBreak.new(swing_high, true, bar_index, line_id))
     
+    // Bearish BOS (break below swing low)
     if not na(swing_low) and close < swing_low
         move_pct = ((swing_low - close) / swing_low) * 100
         volume_ok = not i_bos_volume_filter or volume > volume_sma * i_bos_volume_threshold
         
         if move_pct >= i_bos_min_move and volume_ok
-            line.new(bar_index - i_bos_lookback, swing_low, bar_index, swing_low,
-                    color=color.red, width=2, style=line.style_solid)
-            label.new(bar_index, swing_low, "BOS↓", color=color.red, textcolor=color.white, 
+            line_id = line.new(time[i_bos_lookback], swing_low, time, swing_low, xloc=xloc.bar_time,
+                              color=color.red, width=2, style=line.style_solid)
+            label.new(time, swing_low, "BOS↓", xloc=xloc.bar_time, color=color.red, textcolor=color.white, 
                      style=label.style_label_down, size=size.small)
             current_trend := "bearish"
+            array.push(structure_breaks, StructureBreak.new(swing_low, false, bar_index, line_id))
 
 // ============================================================================
 // MODULE 4: LIQUIDITY POOL LOCATOR
 // ============================================================================
+// Liquidity Pool Definition:
+// - Swing highs/lows where stops are likely placed
+// - Mark potential stop-hunt areas
+// - Multi-TF overlay support
+
+// --- Input Parameters ---
 i_liq_lookback = input.int(20, "Liquidity Lookback", minval=5, group="Liquidity")
 i_liq_min_swing = input.float(0.3, "Minimum Swing Size (% ATR)", minval=0.1, group="Liquidity")
+i_liq_mtf_enabled = input.bool(true, "Enable Multi-Timeframe", group="Liquidity")
+i_liq_htf = input.timeframe("240", "Higher Timeframe", group="Liquidity")
+i_liq_htf2 = input.timeframe("D", "Higher Timeframe 2", group="Liquidity")
 
+// --- Detection Logic ---
 type LiquidityPool
     float level
     bool is_high
@@ -306,6 +412,7 @@ type LiquidityPool
 
 var array<LiquidityPool> liquidity_pools = array.new<LiquidityPool>()
 
+// Detect significant swing high
 f_liquidity_high() =>
     pivot_high = ta.pivothigh(high, i_liq_lookback, i_liq_lookback)
     is_significant = false
@@ -318,6 +425,7 @@ f_liquidity_high() =>
     
     [is_significant, pivot_high]
 
+// Detect significant swing low
 f_liquidity_low() =>
     pivot_low = ta.pivotlow(low, i_liq_lookback, i_liq_lookback)
     is_significant = false
@@ -330,50 +438,64 @@ f_liquidity_low() =>
     
     [is_significant, pivot_low]
 
+// --- Visualization ---
 if i_show_liquidity
     [is_sig_high, liq_high] = f_liquidity_high()
     if is_sig_high
+        // Limit max zones
         if array.size(liquidity_pools) >= i_max_liq_zones
             oldest_liq = array.shift(liquidity_pools)
             line.delete(oldest_liq.line_id)
         
-        line_id = line.new(bar_index - i_liq_lookback, liq_high, bar_index + 10, liq_high,
-                          color=color.yellow, width=1, style=line.style_dotted)
-        label.new(bar_index - i_liq_lookback, liq_high, "LIQ", color=color.yellow, 
+        line_id = line.new(time[i_liq_lookback], liq_high, time, liq_high, xloc=xloc.bar_time,
+                          color=color.yellow, width=1, style=line.style_dotted, extend=extend.right)
+        label.new(time[i_liq_lookback], liq_high, "LIQ", xloc=xloc.bar_time, color=color.yellow, 
                  textcolor=color.black, style=label.style_label_down, size=size.tiny)
         array.push(liquidity_pools, LiquidityPool.new(liq_high, true, bar_index - i_liq_lookback, line_id))
     
     [is_sig_low, liq_low] = f_liquidity_low()
     if is_sig_low
+        // Limit max zones
         if array.size(liquidity_pools) >= i_max_liq_zones
             oldest_liq = array.shift(liquidity_pools)
             line.delete(oldest_liq.line_id)
         
-        line_id = line.new(bar_index - i_liq_lookback, liq_low, bar_index + 10, liq_low,
-                          color=color.yellow, width=1, style=line.style_dotted)
-        label.new(bar_index - i_liq_lookback, liq_low, "LIQ", color=color.yellow, 
+        line_id = line.new(time[i_liq_lookback], liq_low, time, liq_low, xloc=xloc.bar_time,
+                          color=color.yellow, width=1, style=line.style_dotted, extend=extend.right)
+        label.new(time[i_liq_lookback], liq_low, "LIQ", xloc=xloc.bar_time, color=color.yellow, 
                  textcolor=color.black, style=label.style_label_up, size=size.tiny)
         array.push(liquidity_pools, LiquidityPool.new(liq_low, false, bar_index - i_liq_lookback, line_id))
     
+    // Remove swept liquidity
     if array.size(liquidity_pools) > 0
         for i = array.size(liquidity_pools) - 1 to 0
             liq = array.get(liquidity_pools, i)
+            
             is_swept = liq.is_high ? high > liq.level : low < liq.level
             
             if is_swept
+                if i_alert_liq
+                    alert("Liquidity SWEPT: " + (liq.is_high ? "High" : "Low") + " at " + str.tostring(liq.level), alert.freq_once_per_bar)
                 line.delete(liq.line_id)
                 array.remove(liquidity_pools, i)
 
 // ============================================================================
 // MODULE 5: PO3 / FRACTAL MOMENTUM
 // ============================================================================
+// Po3 Definition:
+// - Power of Three phases: Accumulation → Manipulation → Expansion
+// - Detect manipulation leg (stop hunt)
+// - Project expansion targets
+
+// --- Input Parameters ---
 i_po3_enabled = input.bool(true, "Enable Po3 Detection", group="Po3")
 i_po3_fractal_depth = input.int(5, "Fractal Depth", minval=3, group="Po3")
 i_po3_expansion_mult = input.float(1.5, "Expansion Multiplier", minval=1.0, group="Po3")
 i_po3_manipulation_threshold = input.float(0.3, "Manipulation Threshold (% ATR)", minval=0.1, group="Po3")
 
+// --- Detection Logic ---
 type Po3Phase
-    string phase
+    string phase  // "accumulation", "manipulation", "expansion"
     float acc_high
     float acc_low
     float manip_level
@@ -384,15 +506,18 @@ type Po3Phase
 var Po3Phase current_po3 = Po3Phase.new("accumulation", 0.0, 0.0, 0.0, 0.0, 0, na)
 var bool po3_active = false
 
+// Detect accumulation range
 f_detect_accumulation() =>
     range_high = ta.highest(high, i_po3_fractal_depth * 2)
     range_low = ta.lowest(low, i_po3_fractal_depth * 2)
     range_size = range_high - range_low
     atr_value = ta.atr(14)
     
+    // Accumulation if price consolidates in tight range
     is_accumulation = range_size < atr_value * 0.5
     [is_accumulation, range_high, range_low]
 
+// Detect manipulation (stop hunt outside range)
 f_detect_manipulation(float acc_high, float acc_low) =>
     is_manip = false
     manip_level = 0.0
@@ -400,11 +525,13 @@ f_detect_manipulation(float acc_high, float acc_low) =>
     
     atr_value = ta.atr(14)
     
+    // Bearish manipulation (sweep below accumulation low)
     if low < acc_low - (atr_value * i_po3_manipulation_threshold)
         is_manip := true
         manip_level := low
         is_bullish := true
     
+    // Bullish manipulation (sweep above accumulation high)
     if high > acc_high + (atr_value * i_po3_manipulation_threshold)
         is_manip := true
         manip_level := high
@@ -412,6 +539,7 @@ f_detect_manipulation(float acc_high, float acc_low) =>
     
     [is_manip, manip_level, is_bullish]
 
+// --- Visualization ---
 if i_show_po3 and i_po3_enabled
     [is_acc, acc_high, acc_low] = f_detect_accumulation()
     
@@ -426,40 +554,44 @@ if i_show_po3 and i_po3_enabled
         current_po3.phase := "manipulation"
         current_po3.manip_level := manip_level
         
+        // Calculate expansion target
         acc_range = current_po3.acc_high - current_po3.acc_low
         if is_bull_manip
             current_po3.expansion_target := current_po3.acc_high + (acc_range * i_po3_expansion_mult)
-            label.new(bar_index, low, "Po3 MANIP↓→↑", color=color.blue, textcolor=color.white, 
-                     style=label.style_label_up, size=size.small)
+            label.new(time, low, "Po3 MANIP↓→↑", xloc=xloc.bar_time, color=color.blue, textcolor=color.white, style=label.style_label_up, size=size.small)
         else
             current_po3.expansion_target := current_po3.acc_low - (acc_range * i_po3_expansion_mult)
-            label.new(bar_index, high, "Po3 MANIP↑→↓", color=color.blue, textcolor=color.white, 
+            label.new(time, high, "Po3 MANIP↑→↓", xloc=xloc.bar_time, color=color.blue, textcolor=color.white, 
                      style=label.style_label_down, size=size.small)
         
         // Create new expansion target line
-        current_po3.target_line := line.new(bar_index, current_po3.expansion_target, bar_index + 20, current_po3.expansion_target, 
-                                            color=color.blue, width=2, style=line.style_dashed)
+        current_po3.target_line := line.new(time, current_po3.expansion_target, time, current_po3.expansion_target, xloc=xloc.bar_time, 
+                                            color=color.blue, width=2, style=line.style_dashed, extend=extend.right)
         po3_active := true
-    
-    // Extend the target line each bar
-    if po3_active and current_po3.phase == "manipulation" and not na(current_po3.target_line)
-        line.set_x2(current_po3.target_line, bar_index + 20)
 
 // ============================================================================
 // MODULE 6: MULTI-TF CONFLUENCE ENGINE
 // ============================================================================
+// Confluence Scoring:
+// - OB = 30%, FVG = 20%, BOS = 20%, Liquidity = 20%, Po3 = 10%
+// - Returns confidence score 0-100
+// - Trade suggestion: long/short/neutral
+
+// --- Input Parameters ---
 i_conf_enabled = input.bool(true, "Enable Confluence Engine", group="Confluence")
 i_conf_threshold = input.int(70, "Signal Threshold", minval=0, maxval=100, group="Confluence")
-i_conf_ob_weight = input.float(25.0, "OB Weight (%)", minval=0, maxval=100, group="Confluence")
+i_conf_ob_weight = input.float(25.0, "OB Weight (%)", minval=0, maxval=100, group="Confluence", tooltip="Adjusted from user preference")
 i_conf_fvg_weight = input.float(20.0, "FVG Weight (%)", minval=0, maxval=100, group="Confluence")
-i_conf_bos_weight = input.float(15.0, "BOS Weight (%)", minval=0, maxval=100, group="Confluence")
-i_conf_liq_weight = input.float(30.0, "Liquidity Weight (%)", minval=0, maxval=100, group="Confluence")
+i_conf_bos_weight = input.float(15.0, "BOS Weight (%)", minval=0, maxval=100, group="Confluence", tooltip="Adjusted from user preference")
+i_conf_liq_weight = input.float(30.0, "Liquidity Weight (%)", minval=0, maxval=100, group="Confluence", tooltip="Adjusted from user preference - highest priority")
 i_conf_po3_weight = input.float(10.0, "Po3 Weight (%)", minval=0, maxval=100, group="Confluence")
 
+// --- Confluence Calculation ---
 f_calculate_confluence() =>
     bullish_score = 0.0
     bearish_score = 0.0
     
+    // OB contribution
     ob_bull = 0.0
     ob_bear = 0.0
     if array.size(active_obs) > 0
@@ -475,6 +607,7 @@ f_calculate_confluence() =>
     bullish_score += ob_bull * i_conf_ob_weight
     bearish_score += ob_bear * i_conf_ob_weight
     
+    // FVG contribution
     fvg_bull = 0.0
     fvg_bear = 0.0
     if array.size(active_fvgs) > 0
@@ -489,6 +622,7 @@ f_calculate_confluence() =>
     bullish_score += fvg_bull * i_conf_fvg_weight
     bearish_score += fvg_bear * i_conf_fvg_weight
     
+    // BOS contribution
     bos_score = current_trend == "bullish" ? i_conf_bos_weight : current_trend == "bearish" ? i_conf_bos_weight : 0.0
     
     if current_trend == "bullish"
@@ -496,6 +630,7 @@ f_calculate_confluence() =>
     else if current_trend == "bearish"
         bearish_score += bos_score
     
+    // Liquidity contribution (fade liquidity sweeps)
     liq_bull = 0.0
     liq_bear = 0.0
     if array.size(liquidity_pools) > 0
@@ -504,13 +639,14 @@ f_calculate_confluence() =>
             distance = math.abs(close - liq.level)
             if distance < ta.atr(14) * 0.5
                 if liq.is_high
-                    liq_bear := 1.0
+                    liq_bear := 1.0  // Fade sweep of high (expect down)
                 else
-                    liq_bull := 1.0
+                    liq_bull := 1.0  // Fade sweep of low (expect up)
     
     bullish_score += liq_bull * i_conf_liq_weight
     bearish_score += liq_bear * i_conf_liq_weight
     
+    // Po3 contribution
     if po3_active
         po3_signal = current_po3.expansion_target > close ? 1.0 : -1.0
         if po3_signal > 0
@@ -518,16 +654,19 @@ f_calculate_confluence() =>
         else
             bearish_score += i_conf_po3_weight
     
+    // Determine final signal
     net_score = bullish_score - bearish_score
     confidence = math.max(bullish_score, bearish_score)
     direction = net_score > 0 ? "long" : net_score < 0 ? "short" : "neutral"
     
-    [confidence, direction, bullish_score, bearish_score]
+    [confidence, direction]
 
+// --- Visualization ---
 var label conf_label = na
 if i_show_confluence and i_conf_enabled
-    [conf_score, conf_direction, bull_score, bear_score] = f_calculate_confluence()
+    [conf_score, conf_direction] = f_calculate_confluence()
     
+    // Update confluence label
     if not na(conf_label)
         label.delete(conf_label)
     
@@ -535,15 +674,32 @@ if i_show_confluence and i_conf_enabled
         label_color = conf_direction == "long" ? color.green : conf_direction == "short" ? color.red : color.gray
         label_text = conf_direction + " " + str.tostring(conf_score, "#") + "%"
         
-        conf_label := label.new(bar_index, high, label_text, color=label_color, 
-                                textcolor=color.white, style=label.style_label_down, size=size.normal)
+        conf_label := label.new(time, high + ta.atr(14) * 0.5, label_text, xloc=xloc.bar_time, color=label_color, textcolor=color.white, style=label.style_label_down, size=size.normal)
+        
+        // Alert on high confidence signals
+        if conf_score >= i_conf_threshold and (conf_direction == "long" or conf_direction == "short") and i_alert_confluence
+            alert("Confluence Signal: " + conf_direction + " with " + str.tostring(conf_score, "#") + "% confidence", alert.freq_once_per_bar)
 
 // ============================================================================
-// MODULE 7: RISK MANAGER & STRATEGY EXECUTION
+// MODULE 7: COMPOSITE RISK MANAGER
 // ============================================================================
+// Risk Management:
+// - ATR-based stops and targets
+// - Volatility-adjusted position sizing
+// - Risk per trade parameter
+
+// --- Input Parameters ---
+i_risk_enabled = input.bool(true, "Enable Risk Manager", group="Risk Management")
 i_risk_per_trade = input.float(1.0, "Risk Per Trade (%)", minval=0.1, maxval=10.0, group="Risk Management")
 i_risk_atr_mult_stop = input.float(1.5, "ATR Multiplier (Stop)", minval=0.5, group="Risk Management")
 i_risk_atr_mult_target = input.float(3.0, "ATR Multiplier (Target)", minval=1.0, group="Risk Management")
+i_risk_account_size = input.float(10000, "Account Size", minval=100, group="Risk Management")
+
+// --- Risk Calculation ---
+f_calculate_position_size(float stop_distance, float account_size, float risk_pct) =>
+    risk_amount = account_size * (risk_pct / 100)
+    position_size = risk_amount / stop_distance
+    position_size
 
 f_calculate_stops_targets() =>
     atr_value = ta.atr(14)
@@ -556,45 +712,60 @@ f_calculate_stops_targets() =>
     
     [stop_loss_long, stop_loss_short, target_long, target_short]
 
-// Strategy Logic
-[conf_score, conf_direction, bull_score, bear_score] = f_calculate_confluence()
-[sl_long, sl_short, tp_long, tp_short] = f_calculate_stops_targets()
-
-// Entry Conditions
-long_condition = conf_score >= i_conf_threshold and conf_direction == "long" and in_date_range and (i_trade_direction == "Long" or i_trade_direction == "Both")
-short_condition = conf_score >= i_conf_threshold and conf_direction == "short" and in_date_range and (i_trade_direction == "Short" or i_trade_direction == "Both")
-
-// Execute Trades
-if long_condition and strategy.position_size == 0
-    strategy.entry("Long", strategy.long)
-    strategy.exit("Long Exit", "Long", stop=sl_long, limit=tp_long)
-
-if short_condition and strategy.position_size == 0
-    strategy.entry("Short", strategy.short)
-    strategy.exit("Short Exit", "Short", stop=sl_short, limit=tp_short)
-
-// Visual markers for entries
-plotshape(long_condition, "Long Signal", shape.triangleup, location.belowbar, color.green, size=size.small)
-plotshape(short_condition, "Short Signal", shape.triangledown, location.abovebar, color.red, size=size.small)
-
-// Plot equity curve
-plot(strategy.equity, "Equity", color=color.blue, linewidth=2, display=display.none)
+// --- Visualization ---
+if i_risk_enabled
+    [sl_long, sl_short, tp_long, tp_short] = f_calculate_stops_targets()
+    [conf_score, conf_direction] = f_calculate_confluence()
+    
+    if conf_score >= i_conf_threshold
+        if conf_direction == "long"
+            stop_distance = close - sl_long
+            pos_size = f_calculate_position_size(stop_distance, i_risk_account_size, i_risk_per_trade)
+            
+            line.new(time, sl_long, time, sl_long, xloc=xloc.bar_time, color=color.red, width=2, extend=extend.right)
+            line.new(time, tp_long, time, tp_long, xloc=xloc.bar_time, color=color.green, width=2, extend=extend.right)
+            label.new(time, sl_long, "SL", xloc=xloc.bar_time, color=color.red, textcolor=color.white, 
+                     style=label.style_label_up, size=size.tiny)
+            label.new(time, tp_long, "TP", xloc=xloc.bar_time, color=color.green, textcolor=color.white, 
+                     style=label.style_label_down, size=size.tiny)
+        
+        else if conf_direction == "short"
+            stop_distance = sl_short - close
+            pos_size = f_calculate_position_size(stop_distance, i_risk_account_size, i_risk_per_trade)
+            
+            line.new(time, sl_short, time, sl_short, xloc=xloc.bar_time, color=color.red, width=2, extend=extend.right)
+            line.new(time, tp_short, time, tp_short, xloc=xloc.bar_time, color=color.green, width=2, extend=extend.right)
+            label.new(time, sl_short, "SL", xloc=xloc.bar_time, color=color.red, textcolor=color.white, 
+                     style=label.style_label_down, size=size.tiny)
+            label.new(time, tp_short, "TP", xloc=xloc.bar_time, color=color.green, textcolor=color.white, 
+                     style=label.style_label_up, size=size.tiny)
 
 // ============================================================================
-// PERFORMANCE METRICS (displayed in Data Window)
+// MODULE 8: VISUAL & ALERT LAYER
 // ============================================================================
-// Calculate additional metrics with division by zero protection
-total_trades = strategy.closedtrades
-win_rate = total_trades > 0 ? strategy.wintrades / total_trades * 100 : 0
-profit_factor = strategy.grossloss > 0 ? strategy.grossprofit / strategy.grossloss : 0
-avg_win = strategy.wintrades > 0 ? strategy.grossprofit / strategy.wintrades : 0
-avg_loss = strategy.losstrades > 0 ? strategy.grossloss / strategy.losstrades : 0
-rr_ratio = avg_loss > 0 ? avg_win / avg_loss : 0
-expectancy = (win_rate / 100 * avg_win) - ((1 - win_rate / 100) * avg_loss)
+// All visualization and alerts are handled within individual modules above
+// This section documents the color scheme and alert logic:
+//
+// COLOR SCHEME:
+// - Green zones = Long/Bullish signals (OB, FVG)
+// - Red zones = Short/Bearish signals (OB, FVG)
+// - Blue = Po3 phases and neutral confluence
+// - Yellow = Liquidity pools
+//
+// INVALIDATION LOGIC:
+// - OB zones: Removed when price breaks through opposite side
+// - FVG zones: Removed when completely filled
+// - Liquidity: Removed when swept
+//
+// TIME EXTENSION:
+// - All zones extend forward by configurable candle count
+// - Prevents chart clutter while maintaining visibility
+//
+// ALERTS:
+// - FVG first test
+// - Confluence signals above threshold
+// - All alerts use alert.freq_once_per_bar to prevent spam
 
-// Display key metrics (visible in Data Window)
-plot(total_trades, "Total Trades", display=display.data_window)
-plot(win_rate, "Win Rate %", display=display.data_window)
-plot(profit_factor, "Profit Factor", display=display.data_window)
-plot(rr_ratio, "RR Ratio", display=display.data_window)
-plot(expectancy, "Expectancy", display=display.data_window)
+// ============================================================================
+// END OF SCRIPT
+// ============================================================================

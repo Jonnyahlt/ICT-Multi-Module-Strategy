@@ -1,0 +1,1030 @@
+//@version=6
+strategy("ICT Session Engine [Silver Bullet]", overlay=true,
+         initial_capital=50000,
+         default_qty_type=strategy.cash,
+         default_qty_value=400,
+         commission_type=strategy.commission.percent,
+         commission_value=0.1,
+         slippage=2,
+         max_boxes_count=500,
+         max_lines_count=500)
+
+// ============================================================================
+// ICT SESSION ENGINE - Built from ICT Core Concepts
+// ============================================================================
+// Strategy: Silver Bullet (Liquidity Sweep → MSS → FVG Retest → Entry)
+// Sessions: Asia (observe) → London (setup) → NY AM/PM (trade)
+// Designed for: NQ, ES, and other indices with session-based structure
+// ============================================================================
+
+// ========== INPUTS ==========
+// Backtest Period
+i_start_date = input.time(timestamp("2023-01-01 00:00"), "Start Date", group="Backtest")
+i_end_date   = input.time(timestamp("2099-12-31 23:59"), "End Date", group="Backtest")
+in_date_range = time >= i_start_date and time <= i_end_date
+
+// Session Selection
+i_trade_london = input.bool(true, "Trade London SB (03:00-04:00 ET)", group="Sessions")
+i_trade_ny_am = input.bool(true, "Trade NY AM SB (10:00-11:00 ET)", group="Sessions")
+i_trade_ny_pm = input.bool(false, "Trade NY PM SB (14:00-15:00 ET)", group="Sessions", tooltip="Less reliable, recommended OFF for indices")
+
+// Risk Management
+i_risk_dollars = input.float(400.0, "Risk per trade ($)", 50.0, group="Risk", tooltip="Fixed dollar risk per trade")
+i_rr_ratio = input.float(2.0, "Risk:Reward Ratio", 1.0, 5.0, group="Risk", tooltip="2.0 = 2:1 RR (20 pips risk, 40 pips target)")
+i_use_atr_stops = input.bool(true, "Use ATR-based stops", group="Risk")
+i_atr_stop_mult = input.float(1.5, "ATR Stop Multiplier", 0.5, 3.0, group="Risk")
+i_trail_enabled = input.bool(true, "Enable Trailing Stop", group="Risk")
+i_trail_trigger = input.float(1.0, "Trail after X:1 R", 0.5, 2.0, group="Risk", tooltip="Start trailing after 1:1 reward hit")
+
+// FVG Settings
+i_fvg_sensitivity = input.string("Normal", "FVG Sensitivity", options=["Extreme", "High", "Normal", "Low"], group="FVG", tooltip="Extreme=6x ATR, High=2x, Normal=1.5x, Low=1x ATR minimum size")
+i_fvg_min_size_override = input.float(0.0, "FVG Min Size Override (0=use ATR)", 0.0, group="FVG", tooltip="Manual minimum FVG size in price points. 0 = use ATR-based calculation")
+i_fvg_require_retracement = input.bool(true, "Require FVG Retracement", group="FVG", tooltip="Wait for price to retrace into FVG before entry (recommended)")
+i_fvg_bar_type_check = input.bool(true, "Same Bar Type Filter", group="FVG", tooltip="All 3 bars forming FVG must be same type (bullish/bearish)")
+i_fvg_max_age = input.int(20, "FVG Max Age (bars)", 5, 50, group="FVG", tooltip="How long FVG stays valid")
+
+// MSS Settings
+i_mss_lookback = input.int(10, "MSS Lookback (bars)", 5, 30, group="Structure", tooltip="Swing detection for Market Structure Shift")
+
+// Visual
+i_show_sessions = input.bool(true, "Show Session Boxes", group="Visual")
+i_show_fvg = input.bool(true, "Show FVG Zones", group="Visual")
+i_show_liquidity = input.bool(true, "Show Liquidity Levels", group="Visual")
+i_show_labels = input.bool(true, "Show Entry Labels", group="Visual")
+i_extend_mitigated_lines = input.bool(false, "Extend lines after mitigation", group="Visual", tooltip="If OFF, lines stop extending when mitigated")
+i_daily_reset_enabled = input.bool(false, "Enable Daily Reset", group="Visual", tooltip="Reset all visual elements at specific time")
+i_daily_reset_time = input.string("1800", "Reset Time (HHMM ET)", group="Visual", tooltip="Time in Eastern Time (e.g., 1800 = 6:00 PM)")
+
+// ========== SESSION DETECTION (EST/ET) ==========
+// ICT uses Eastern Time (adjusts for DST automatically in TradingView)
+// Session ranges in HHMM format for time() function
+
+// SESSIONS (Range building, liquidity reference)
+// ================================================
+// Asia Session (20:00-00:00 ET) - Build range for next day
+in_asia_session = not na(time(timeframe.period, "2000-0000", "America/New_York"))
+
+// London Session (02:00-05:00 ET) - Setup phase, sweep Asia range
+in_london_session = not na(time(timeframe.period, "0200-0500", "America/New_York"))
+
+// NY AM Session (09:30-11:00 ET) - Primary institutional killzone
+in_ny_am_session = not na(time(timeframe.period, "0930-1100", "America/New_York"))
+
+// NY PM Session (13:30-16:00 ET) - Afternoon institutional killzone
+in_ny_pm_session = not na(time(timeframe.period, "1330-1600", "America/New_York"))
+
+// SILVER BULLET WINDOWS (1-hour entry windows WITHIN sessions)
+// ============================================================
+// London Silver Bullet (03:00-04:00 ET) - SUBSET of London session
+in_london_sb = not na(time(timeframe.period, "0300-0400", "America/New_York"))
+
+// NY AM Silver Bullet (10:00-11:00 ET) - SUBSET of NY AM session
+in_ny_am_sb = not na(time(timeframe.period, "1000-1100", "America/New_York"))
+
+// NY PM Silver Bullet (14:00-15:00 ET) - SUBSET of NY PM session
+in_ny_pm_sb = not na(time(timeframe.period, "1400-1500", "America/New_York"))
+
+// Active Silver Bullet window (ENTRY ALLOWED)
+in_sb_window = (i_trade_london and in_london_sb) or 
+               (i_trade_ny_am and in_ny_am_sb) or 
+               (i_trade_ny_pm and in_ny_pm_sb)
+
+// Current session label for dashboard
+current_session = in_asia_session ? "Asia" : in_london_session ? "London" : in_ny_am_session ? "NY AM" : in_ny_pm_session ? "NY PM" : "Closed"
+current_sb_status = in_london_sb ? "London SB" : in_ny_am_sb ? "NY AM SB" : in_ny_pm_sb ? "NY PM SB" : "No SB"
+
+// ========== DAILY BIAS (Higher Timeframe Structure) ==========
+// Daily 50 EMA for institutional bias
+daily_ema = request.security(syminfo.tickerid, "D", ta.ema(close, 50), lookahead=barmerge.lookahead_off)
+daily_bias_bull = close > daily_ema
+daily_bias_bear = close < daily_ema
+
+// Weekly/Monthly bias for stronger filtering
+weekly_ema = request.security(syminfo.tickerid, "W", ta.ema(close, 20), lookahead=barmerge.lookahead_off)
+monthly_ema = request.security(syminfo.tickerid, "M", ta.ema(close, 12), lookahead=barmerge.lookahead_off)
+weekly_bias_bull = close > weekly_ema
+weekly_bias_bear = close < weekly_ema
+monthly_bias_bull = close > monthly_ema
+monthly_bias_bear = close < monthly_ema
+
+// Combined HTF bias (all timeframes aligned = strongest signal)
+htf_bias_bull = daily_bias_bull and weekly_bias_bull and monthly_bias_bull
+htf_bias_bear = daily_bias_bear and weekly_bias_bear and monthly_bias_bear
+htf_bias_aligned = htf_bias_bull or htf_bias_bear
+
+// Premium/Discount zones (50% of daily range)
+daily_high = request.security(syminfo.tickerid, "D", high, lookahead=barmerge.lookahead_off)
+daily_low = request.security(syminfo.tickerid, "D", low, lookahead=barmerge.lookahead_off)
+daily_mid = (daily_high + daily_low) / 2
+in_discount = close < daily_mid  // Below 50% = discount (buy zone)
+in_premium = close > daily_mid   // Above 50% = premium (sell zone)
+
+// ========== SESSION RANGE TRACKING ==========
+// Track FULL session high/low across entire session period (not just SB window)
+// These ranges form liquidity pools that get swept
+
+// Asia range (FULL 4-hour session: 20:00-00:00)
+var float asia_high = na
+var float asia_low = na
+var int asia_start_bar = na
+var int asia_high_bar = na  // Track which bar made the high
+var int asia_low_bar = na   // Track which bar made the low
+
+if in_asia_session and na(asia_high)
+    asia_high := high
+    asia_low := low
+    asia_start_bar := bar_index
+    asia_high_bar := bar_index
+    asia_low_bar := bar_index
+else if in_asia_session
+    if high > asia_high
+        asia_high := high
+        asia_high_bar := bar_index
+    if low < asia_low
+        asia_low := low
+        asia_low_bar := bar_index
+
+// London range (FULL 3-hour session: 02:00-05:00)
+var float london_high = na
+var float london_low = na
+var int london_start_bar = na
+var int london_high_bar = na
+var int london_low_bar = na
+
+if in_london_session and na(london_high)
+    london_high := high
+    london_low := low
+    london_start_bar := bar_index
+    london_high_bar := bar_index
+    london_low_bar := bar_index
+else if in_london_session
+    if high > london_high
+        london_high := high
+        london_high_bar := bar_index
+    if low < london_low
+        london_low := low
+        london_low_bar := bar_index
+
+// NY AM range (FULL 1.5-hour session: 09:30-11:00)
+var float ny_am_high = na
+var float ny_am_low = na
+var int ny_am_start_bar = na
+var int ny_am_high_bar = na
+var int ny_am_low_bar = na
+
+if in_ny_am_session and na(ny_am_high)
+    ny_am_high := high
+    ny_am_low := low
+    ny_am_start_bar := bar_index
+    ny_am_high_bar := bar_index
+    ny_am_low_bar := bar_index
+else if in_ny_am_session
+    if high > ny_am_high
+        ny_am_high := high
+        ny_am_high_bar := bar_index
+    if low < ny_am_low
+        ny_am_low := low
+        ny_am_low_bar := bar_index
+
+// NY PM range (FULL 2.5-hour session: 13:30-16:00)
+var float ny_pm_high = na
+var float ny_pm_low = na
+var int ny_pm_start_bar = na
+var int ny_pm_high_bar = na
+var int ny_pm_low_bar = na
+
+if in_ny_pm_session and na(ny_pm_high)
+    ny_pm_high := high
+    ny_pm_low := low
+    ny_pm_start_bar := bar_index
+    ny_pm_high_bar := bar_index
+    ny_pm_low_bar := bar_index
+else if in_ny_pm_session
+    if high > ny_pm_high
+        ny_pm_high := high
+        ny_pm_high_bar := bar_index
+    if low < ny_pm_low
+        ny_pm_low := low
+        ny_pm_low_bar := bar_index
+
+// Reset ranges at end of each session
+if in_london_session and not in_london_session[1]
+    // Lock Asia range when London starts
+    asia_high := asia_high
+    asia_low := asia_low
+
+if in_asia_session and not in_asia_session[1]
+    // Reset all ranges for new trading day
+    asia_high := na
+    asia_low := na
+    london_high := na
+    london_low := na
+    ny_am_high := na
+    ny_am_low := na
+    ny_pm_high := na
+    ny_pm_low := na
+
+// ========== VISUAL ELEMENTS ==========
+
+// Session line data storage (declare BEFORE daily reset uses it)
+type SessionLine
+    int start_bar
+    float level
+    color line_color
+    string label_text
+    bool is_mitigated
+    line line_id
+    label label_id
+
+var array<SessionLine> session_lines = array.new<SessionLine>()
+
+// MSS lines (declare before use)
+var line mss_bull_line = na
+var line mss_bear_line = na
+var label mss_bull_label = na
+var label mss_bear_label = na
+
+// Liquidity lines (declare before use)
+var line bsl_line = na
+var line ssl_line = na
+var label bsl_label = na
+var label ssl_label = na
+
+// Daily reset at user-specified time (clears all visual elements)
+var bool daily_reset_triggered = false
+if i_daily_reset_enabled
+    // Check if we're at the reset time
+    in_reset_time = not na(time(timeframe.period, i_daily_reset_time + "-" + i_daily_reset_time, "America/New_York"))
+    if in_reset_time and not daily_reset_triggered
+        // Delete all session lines
+        if array.size(session_lines) > 0
+            for i = array.size(session_lines) - 1 to 0
+                sess_line = array.get(session_lines, i)
+                if not na(sess_line.line_id)
+                    line.delete(sess_line.line_id)
+                if not na(sess_line.label_id)
+                    label.delete(sess_line.label_id)
+            array.clear(session_lines)
+        // Delete MSS lines
+        line.delete(mss_bull_line)
+        line.delete(mss_bear_line)
+        label.delete(mss_bull_label)
+        label.delete(mss_bear_label)
+        mss_bull_line := na
+        mss_bear_line := na
+        mss_bull_label := na
+        mss_bear_label := na
+        // Delete liquidity lines
+        line.delete(bsl_line)
+        line.delete(ssl_line)
+        label.delete(bsl_label)
+        label.delete(ssl_label)
+        bsl_line := na
+        ssl_line := na
+        bsl_label := na
+        ssl_label := na
+        daily_reset_triggered := true
+    if not in_reset_time
+        daily_reset_triggered := false
+
+// ========== LIQUIDITY DETECTION ==========
+// ICT: Sessions establish high/low ranges that form liquidity pools
+// Buy-Side Liquidity (BSL) = Above session highs (stop hunts bulls)
+// Sell-Side Liquidity (SSL) = Below session lows (stop hunts bears)
+
+swing_high = ta.pivothigh(high, i_mss_lookback, i_mss_lookback)
+swing_low = ta.pivotlow(low, i_mss_lookback, i_mss_lookback)
+
+// Store recent liquidity levels (from swing points)
+var float bsl_level = na  // Buy-Side Liquidity
+var float ssl_level = na  // Sell-Side Liquidity
+
+if not na(swing_high)
+    bsl_level := swing_high
+if not na(swing_low)
+    ssl_level := swing_low
+
+// ========== LIQUIDITY SWEEP DETECTION (DUAL MODE) ==========
+// ICT Silver Bullet uses TWO types of sweeps:
+// 1. INTER-SESSION: London sweeps Asia high/low, NY AM sweeps London high/low (CLASSIC ICT)
+// 2. INTRA-SESSION: Session sweeps its own established high/low during active session
+
+// --- INTER-SESSION SWEEP (Previous session liquidity) ---
+// This is the PRIMARY ICT Silver Bullet setup pattern
+var float prev_session_high = na
+var float prev_session_low = na
+
+// Determine which PREVIOUS session high/low to monitor based on current session
+if in_london_session
+    // London monitors Asia range (most recent completed session)
+    prev_session_high := asia_high
+    prev_session_low := asia_low
+else if in_ny_am_session
+    // NY AM monitors London range (most recent completed session)
+    prev_session_high := london_high
+    prev_session_low := london_low
+else if in_ny_pm_session
+    // NY PM monitors NY AM range (most recent completed session)
+    prev_session_high := ny_am_high
+    prev_session_low := ny_am_low
+
+// Inter-session sweep detection (NEW session sweeps PREVIOUS session high/low)
+// BSL Sweep = High breaks above previous session high, then closes below
+bsl_swept_prev_session = not na(prev_session_high) and bar_index > 0 and high > prev_session_high and close < prev_session_high
+
+// SSL Sweep = Low breaks below previous session low, then closes above
+ssl_swept_prev_session = not na(prev_session_low) and bar_index > 0 and low < prev_session_low and close > prev_session_low
+
+// --- INTRA-SESSION SWEEP (Current session own liquidity) ---
+// Track current session high/low for self-sweeps
+var float current_session_high = na
+var float current_session_low = na
+
+if in_london_session
+    current_session_high := london_high
+    current_session_low := london_low
+else if in_ny_am_session
+    current_session_high := ny_am_high
+    current_session_low := ny_am_low
+else if in_ny_pm_session
+    current_session_high := ny_pm_high
+    current_session_low := ny_pm_low
+else if in_asia_session
+    current_session_high := asia_high
+    current_session_low := asia_low
+
+// Intra-session sweep detection (session sweeps its OWN high/low)
+// BSL Sweep = High breaks above current session high, then closes below
+bsl_swept_current_session = not na(current_session_high) and bar_index > 0 and high > current_session_high[1] and close < current_session_high[1]
+
+// SSL Sweep = Low breaks below current session low, then closes above
+ssl_swept_current_session = not na(current_session_low) and bar_index > 0 and low < current_session_low[1] and close > current_session_low[1]
+
+// --- COMBINED SESSION SWEEP (Either type triggers) ---
+bsl_swept_session = bsl_swept_prev_session or bsl_swept_current_session
+ssl_swept_session = ssl_swept_prev_session or ssl_swept_current_session
+
+// Legacy swing point sweeps (backup method)
+bsl_swept = not na(bsl_level) and high > bsl_level and close < bsl_level
+ssl_swept = not na(ssl_level) and low < ssl_level and close > ssl_level
+
+// Combined sweep detection (session OR swing point)
+liquidity_swept_up = bsl_swept_session or bsl_swept
+liquidity_swept_down = ssl_swept_session or ssl_swept
+
+// ========== MARKET STRUCTURE SHIFT (MSS) / CHOCH ==========
+// Break of structure indicating trend change
+// Bullish MSS = Break above recent high after downtrend
+// Bearish MSS = Break below recent low after uptrend
+
+recent_high = ta.highest(high, i_mss_lookback)
+recent_low = ta.lowest(low, i_mss_lookback)
+
+mss_bullish = close > recent_high[1] and close[1] < recent_low[2]  // Break up after down
+mss_bearish = close < recent_low[1] and close[1] > recent_high[2]  // Break down after up
+
+// Track new MSS for visualization
+var int mss_bullish_bar = na
+var int mss_bearish_bar = na
+var float mss_bullish_price = na
+var float mss_bearish_price = na
+
+if mss_bullish
+    mss_bullish_bar := bar_index
+    mss_bullish_price := close
+if mss_bearish
+    mss_bearish_bar := bar_index
+    mss_bearish_price := close
+
+// ========== FAIR VALUE GAP (FVG) DETECTION ==========
+// 3-candle imbalance: gap between candle 1 and candle 3
+// Bullish FVG: high[2] < low (gap up) - acts as demand zone
+// Bearish FVG: low[2] > high (gap down) - acts as supply zone
+
+atr = ta.atr(14)
+
+// ATR-based FVG sensitivity (adapts to volatility)
+fvg_sensitivity_mult = i_fvg_sensitivity == "Extreme" ? 6.0 : i_fvg_sensitivity == "High" ? 2.0 : i_fvg_sensitivity == "Normal" ? 1.5 : 1.0
+fvg_min_size = i_fvg_min_size_override > 0 ? i_fvg_min_size_override : atr * fvg_sensitivity_mult
+
+// Bar type check (all 3 bars same type for quality)
+bars_same_type_bull = close > open and close[1] > open[1] and close[2] > open[2]
+bars_same_type_bear = close < open and close[1] < open[1] and close[2] < open[2]
+bar_type_valid = i_fvg_bar_type_check ? (bars_same_type_bull or bars_same_type_bear) : true
+
+// Detect FVG with improved filters
+bullish_fvg = high[2] < low and (low - high[2]) >= fvg_min_size and bar_type_valid and (not i_fvg_bar_type_check or bars_same_type_bull)
+bearish_fvg = low[2] > high and (low[2] - high) >= fvg_min_size and bar_type_valid and (not i_fvg_bar_type_check or bars_same_type_bear)
+
+// FVG boundaries
+bull_fvg_top = bullish_fvg ? low : na
+bull_fvg_bottom = bullish_fvg ? high[2] : na
+bear_fvg_top = bearish_fvg ? low[2] : na
+bear_fvg_bottom = bearish_fvg ? high : na
+
+// Track active FVGs (store in arrays)
+type FVG
+    float top
+    float bottom
+    bool is_bullish
+    int birth_bar
+    bool touched
+    bool retraced  // Track if price has retraced into FVG
+    box box_id     // Track the visual box
+    bool is_first_of_session  // First FVG in session = more significant
+
+var array<FVG> active_fvgs = array.new<FVG>()
+var int fvgs_this_session = 0  // Count FVGs in current session
+
+// Reset FVG counter at start of new trading day
+if in_asia_session and not in_asia_session[1]
+    fvgs_this_session := 0
+
+// Add new FVGs and draw boxes immediately at formation
+if bullish_fvg and barstate.isconfirmed
+    is_first = fvgs_this_session == 0
+    fvgs_this_session += 1
+    // First FVG gets thicker border and solid style
+    border_width = is_first ? 2 : 1
+    border_style = is_first ? line.style_solid : line.style_dashed
+    fvg_box = i_show_fvg ? box.new(bar_index - 2, bull_fvg_top, bar_index, bull_fvg_bottom, xloc=xloc.bar_index, border_color=color.new(color.green, is_first ? 0 : 40), bgcolor=color.new(color.green, 90), border_width=border_width, border_style=border_style) : na
+    array.push(active_fvgs, FVG.new(bull_fvg_top, bull_fvg_bottom, true, bar_index, false, false, fvg_box, is_first))
+    if i_show_fvg
+        label_text = is_first ? "FVG #1" : "FVG"
+        label.new(bar_index - 1, (bull_fvg_top + bull_fvg_bottom) / 2, label_text, xloc=xloc.bar_index, style=label.style_none, color=color.green, textcolor=color.green, size=size.tiny)
+
+if bearish_fvg and barstate.isconfirmed
+    is_first = fvgs_this_session == 0
+    fvgs_this_session += 1
+    // First FVG gets thicker border and solid style
+    border_width = is_first ? 2 : 1
+    border_style = is_first ? line.style_solid : line.style_dashed
+    fvg_box = i_show_fvg ? box.new(bar_index - 2, bear_fvg_top, bar_index, bear_fvg_bottom, xloc=xloc.bar_index, border_color=color.new(color.red, is_first ? 0 : 40), bgcolor=color.new(color.red, 90), border_width=border_width, border_style=border_style) : na
+    array.push(active_fvgs, FVG.new(bear_fvg_top, bear_fvg_bottom, false, bar_index, false, false, fvg_box, is_first))
+    if i_show_fvg
+        label_text = is_first ? "FVG #1" : "FVG"
+        label.new(bar_index - 1, (bear_fvg_top + bear_fvg_bottom) / 2, label_text, xloc=xloc.bar_index, style=label.style_none, color=color.red, textcolor=color.red, size=size.tiny)
+
+// === UPPDATERA ALLA AKTIVA FVG-BOXAR PÅ VARJE BAR (KRITISKT!) ===
+if array.size(active_fvgs) > 0
+    for i = array.size(active_fvgs) - 1 to 0
+        fvg = array.get(active_fvgs, i)
+        age = bar_index - fvg.birth_bar
+        
+        // 1. Uppdatera högerkanten så boxen alltid sträcker sig framåt (VIKTIGT!)
+        // Performance optimization: skip set_right for old FVGs to reduce CPU usage
+        if not na(fvg.box_id) and age <= i_fvg_max_age
+            box.set_right(fvg.box_id, bar_index + 50)  // Sträck 50 bars framåt
+        
+        // 2. Check if price has retraced into FVG
+        if not fvg.retraced
+            if fvg.is_bullish and low <= fvg.top and high >= fvg.bottom
+                fvg.retraced := true
+                array.set(active_fvgs, i, fvg)
+            if not fvg.is_bullish and high >= fvg.bottom and low <= fvg.top
+                fvg.retraced := true
+                array.set(active_fvgs, i, fvg)
+        
+        // 3. Check if touched (price went through FVG)
+        if fvg.is_bullish and low <= fvg.top and high >= fvg.bottom
+            fvg.touched := true
+            array.set(active_fvgs, i, fvg)
+        if not fvg.is_bullish and high >= fvg.bottom and low <= fvg.top
+            fvg.touched := true
+            array.set(active_fvgs, i, fvg)
+        
+        // 4. Remove if old or filled through, and delete box
+        // BUT: First FVG of session stays until session ends (not removed when touched)
+        filled = fvg.is_bullish ? close < fvg.bottom : close > fvg.top
+        should_remove = false
+        if fvg.is_first_of_session
+            // First FVG: only remove if too old (session ended) - lives 3x longer
+            should_remove := age > i_fvg_max_age * 3
+        else
+            // Regular FVG: remove if filled or too old
+            should_remove := filled or age > i_fvg_max_age
+        
+        if should_remove
+            if not na(fvg.box_id)
+                box.delete(fvg.box_id)
+            array.remove(active_fvgs, i)
+
+// ========== SILVER BULLET SETUP LOGIC ==========
+// Complete ICT Silver Bullet methodology:
+// 1. Daily bias determines direction (bull/bear)
+// 2. Wait for liquidity sweep (SSL for longs, BSL for shorts)
+// 3. Confirm MSS in reversal direction
+// 4. Wait for price to retrace into FVG (discount for longs, premium for shorts)
+// 5. Enter on FVG boundary during Silver Bullet window
+
+// Find valid FVG for entry (must be retraced if retracement required)
+var float entry_fvg_top = na
+var float entry_fvg_bottom = na
+var bool entry_fvg_valid = false
+
+if array.size(active_fvgs) > 0
+    entry_fvg_valid := false
+    // Get most recent FVG that meets retracement requirement
+    for i = array.size(active_fvgs) - 1 to 0
+        fvg = array.get(active_fvgs, i)
+        // Check if FVG is valid for entry
+        retracement_ok = i_fvg_require_retracement ? fvg.retraced : true
+        if not fvg.touched and retracement_ok
+            entry_fvg_top := fvg.top
+            entry_fvg_bottom := fvg.bottom
+            entry_fvg_valid := true
+            break
+else
+    entry_fvg_valid := false
+
+// Entry Conditions (CRITICAL: Session sweep + FVG retest + SB window)
+// LONG: SSL swept (session low violated) → MSS bullish → FVG retest in discount zone → Entry during SB window
+long_setup = daily_bias_bull and liquidity_swept_down and mss_bullish and entry_fvg_valid and 
+             low <= entry_fvg_top and high >= entry_fvg_bottom and 
+             in_discount and in_sb_window and in_date_range
+
+// SHORT: BSL swept (session high violated) → MSS bearish → FVG retest in premium zone → Entry during SB window
+short_setup = daily_bias_bear and liquidity_swept_up and mss_bearish and entry_fvg_valid and 
+              high >= entry_fvg_bottom and low <= entry_fvg_top and 
+              in_premium and in_sb_window and in_date_range
+
+// Alert conditions for setup detection
+alertcondition(long_setup, title="Long SB Setup", message="🟢 LONG Silver Bullet Setup: SSL Swept + MSS Bullish + FVG Retest in Discount Zone")
+alertcondition(short_setup, title="Short SB Setup", message="🔴 SHORT Silver Bullet Setup: BSL Swept + MSS Bearish + FVG Retest in Premium Zone")
+alertcondition(htf_bias_aligned and in_sb_window, title="HTF Bias Aligned", message="⭐ HTF Bias Aligned: Daily/Weekly/Monthly all in sync during SB window")
+
+// ========== RISK MANAGEMENT (Fixed $ Risk) ==========
+// ATR already calculated in FVG section
+
+// Calculate MSS-based stop levels (for dashboard reference)
+recommended_stop_long = recent_low - (atr * i_atr_stop_mult)
+recommended_stop_short = recent_high + (atr * i_atr_stop_mult)
+
+// Calculate stop distance
+stop_distance_long = i_use_atr_stops ? atr * i_atr_stop_mult : entry_fvg_bottom - entry_fvg_top
+stop_distance_short = i_use_atr_stops ? atr * i_atr_stop_mult : entry_fvg_top - entry_fvg_bottom
+
+// Calculate position size based on fixed $ risk
+// Position Size = Risk $ / Stop Distance (in price)
+// For NQ: $400 risk / (20 points stop * $20/point) = 1 contract
+qty_long = i_risk_dollars / (stop_distance_long * syminfo.pointvalue)
+qty_short = i_risk_dollars / (stop_distance_short * syminfo.pointvalue)
+
+// Entry prices and stops
+entry_long = entry_fvg_bottom  // Enter at FVG low (demand)
+stop_long = entry_long - stop_distance_long
+target_long = entry_long + (stop_distance_long * i_rr_ratio)
+
+entry_short = entry_fvg_top  // Enter at FVG high (supply)
+stop_short = entry_short + stop_distance_short
+target_short = entry_short - (stop_distance_short * i_rr_ratio)
+
+// ========== STRATEGY EXECUTION ==========
+// Track if in position
+var bool in_long_position = false
+var bool in_short_position = false
+var float entry_price = na
+var float stop_price = na
+var float target_price = na
+var bool trail_active = false
+
+// Long Entry
+if long_setup and strategy.position_size == 0
+    strategy.entry("Long", strategy.long, qty=qty_long, limit=entry_long)
+    in_long_position := true
+    entry_price := entry_long
+    stop_price := stop_long
+    target_price := target_long
+    trail_active := false
+
+// Short Entry
+if short_setup and strategy.position_size == 0
+    strategy.entry("Short", strategy.short, qty=qty_short, limit=entry_short)
+    in_short_position := true
+    entry_price := entry_short
+    stop_price := stop_short
+    target_price := target_short
+    trail_active := false
+
+// Exit Management
+if strategy.position_size > 0  // Long position
+    // Check if trail trigger hit
+    if i_trail_enabled and not trail_active and high >= entry_price + (stop_distance_long * i_trail_trigger)
+        trail_active := true
+    
+    // Trailing stop (move to breakeven after trigger)
+    active_stop = trail_active ? math.max(stop_price, close - atr * 0.5) : stop_price
+    
+    strategy.exit("Exit Long", "Long", stop=active_stop, limit=target_price)
+
+if strategy.position_size < 0  // Short position
+    // Check if trail trigger hit
+    if i_trail_enabled and not trail_active and low <= entry_price - (stop_distance_short * i_trail_trigger)
+        trail_active := true
+    
+    // Trailing stop
+    active_stop = trail_active ? math.min(stop_price, close + atr * 0.5) : stop_price
+    
+    strategy.exit("Exit Short", "Short", stop=active_stop, limit=target_price)
+
+// Reset position tracking
+if strategy.position_size == 0
+    in_long_position := false
+    in_short_position := false
+    trail_active := false
+
+// ========== SESSION LINE DRAWING ==========
+
+// Track session lines (add to array when created)
+// Asia lines: Draw when London starts (02:00), showing Asia range from previous session (20:00-00:00)
+if in_london_session and not in_london_session[1] and not na(asia_high) and not na(asia_start_bar)
+    // Remove old Asia lines
+    if array.size(session_lines) > 0
+        for i = array.size(session_lines) - 1 to 0
+            sess_line = array.get(session_lines, i)
+            if str.contains(sess_line.label_text, "Asia")
+                if not na(sess_line.line_id)
+                    line.delete(sess_line.line_id)
+                if not na(sess_line.label_id)
+                    label.delete(sess_line.label_id)
+                array.remove(session_lines, i)
+    // Add new Asia lines starting from the bar where high/low was established
+    if i_show_sessions and not na(asia_high_bar) and not na(asia_low_bar)
+        // Determine extend mode based on mitigation setting
+        extend_mode = i_extend_mitigated_lines ? extend.right : extend.none
+        
+        h_line = line.new(asia_high_bar, asia_high, bar_index + 1, asia_high, xloc=xloc.bar_index, extend=extend_mode, color=color.new(color.purple, 30), style=line.style_solid, width=2)
+        h_label = label.new(asia_high_bar, asia_high, "Asia H", xloc=xloc.bar_index, style=label.style_none, color=color.new(color.purple, 30), textcolor=color.new(color.purple, 30), size=size.tiny)
+        array.push(session_lines, SessionLine.new(asia_high_bar, asia_high, color.new(color.purple, 30), "Asia H", false, h_line, h_label))
+        
+        l_line = line.new(asia_low_bar, asia_low, bar_index + 1, asia_low, xloc=xloc.bar_index, extend=extend_mode, color=color.new(color.purple, 30), style=line.style_solid, width=2)
+        l_label = label.new(asia_low_bar, asia_low, "Asia L", xloc=xloc.bar_index, style=label.style_none, color=color.new(color.purple, 30), textcolor=color.new(color.purple, 30), size=size.tiny)
+        array.push(session_lines, SessionLine.new(asia_low_bar, asia_low, color.new(color.purple, 30), "Asia L", false, l_line, l_label))
+
+// Check mitigation for Asia lines
+if array.size(session_lines) > 0 and not na(asia_high) and not na(asia_low)
+    for i = array.size(session_lines) - 1 to 0
+        sess_line = array.get(session_lines, i)
+        if not sess_line.is_mitigated
+            if str.contains(sess_line.label_text, "Asia H") and close > asia_high
+                sess_line.is_mitigated := true
+                array.set(session_lines, i, sess_line)
+                // Stop extending line if setting is OFF
+                if not i_extend_mitigated_lines and not na(sess_line.line_id)
+                    line.set_extend(sess_line.line_id, extend.none)
+                    line.set_x2(sess_line.line_id, bar_index)
+            if str.contains(sess_line.label_text, "Asia L") and close < asia_low
+                sess_line.is_mitigated := true
+                array.set(session_lines, i, sess_line)
+                // Stop extending line if setting is OFF
+                if not i_extend_mitigated_lines and not na(sess_line.line_id)
+                    line.set_extend(sess_line.line_id, extend.none)
+                    line.set_x2(sess_line.line_id, bar_index)
+    
+// London lines: Draw when NY AM starts (09:30), showing London range from 02:00-05:00
+if in_ny_am_session and not in_ny_am_session[1] and not na(london_high) and not na(london_start_bar)
+    if array.size(session_lines) > 0
+        for i = array.size(session_lines) - 1 to 0
+            sess_line = array.get(session_lines, i)
+            if str.contains(sess_line.label_text, "LDN")
+                if not na(sess_line.line_id)
+                    line.delete(sess_line.line_id)
+                if not na(sess_line.label_id)
+                    label.delete(sess_line.label_id)
+                array.remove(session_lines, i)
+    // Add new London lines starting from the bar where high/low was established
+    if i_show_sessions and not na(london_high_bar) and not na(london_low_bar)
+        extend_mode = i_extend_mitigated_lines ? extend.right : extend.none
+        
+        h_line = line.new(london_high_bar, london_high, bar_index + 1, london_high, xloc=xloc.bar_index, extend=extend_mode, color=color.new(color.red, 30), style=line.style_solid, width=2)
+        h_label = label.new(london_high_bar, london_high, "LDN H", xloc=xloc.bar_index, style=label.style_none, color=color.new(color.red, 30), textcolor=color.new(color.red, 30), size=size.tiny)
+        array.push(session_lines, SessionLine.new(london_high_bar, london_high, color.new(color.red, 30), "LDN H", false, h_line, h_label))
+        
+        l_line = line.new(london_low_bar, london_low, bar_index + 1, london_low, xloc=xloc.bar_index, extend=extend_mode, color=color.new(color.red, 30), style=line.style_solid, width=2)
+        l_label = label.new(london_low_bar, london_low, "LDN L", xloc=xloc.bar_index, style=label.style_none, color=color.new(color.red, 30), textcolor=color.new(color.red, 30), size=size.tiny)
+        array.push(session_lines, SessionLine.new(london_low_bar, london_low, color.new(color.red, 30), "LDN L", false, l_line, l_label))
+
+// Check London mitigation
+if array.size(session_lines) > 0 and not na(london_high) and not na(london_low)
+    for i = array.size(session_lines) - 1 to 0
+        sess_line = array.get(session_lines, i)
+        if not sess_line.is_mitigated
+            if str.contains(sess_line.label_text, "LDN H") and close > london_high
+                sess_line.is_mitigated := true
+                array.set(session_lines, i, sess_line)
+                if not i_extend_mitigated_lines and not na(sess_line.line_id)
+                    line.set_extend(sess_line.line_id, extend.none)
+                    line.set_x2(sess_line.line_id, bar_index)
+            if str.contains(sess_line.label_text, "LDN L") and close < london_low
+                sess_line.is_mitigated := true
+                array.set(session_lines, i, sess_line)
+                if not i_extend_mitigated_lines and not na(sess_line.line_id)
+                    line.set_extend(sess_line.line_id, extend.none)
+                    line.set_x2(sess_line.line_id, bar_index)
+
+// NY AM lines: Draw when NY PM starts (13:30), showing NY AM range from 09:30-11:00
+if in_ny_pm_session and not in_ny_pm_session[1] and not na(ny_am_high) and not na(ny_am_start_bar)
+    if array.size(session_lines) > 0
+        for i = array.size(session_lines) - 1 to 0
+            sess_line = array.get(session_lines, i)
+            if str.contains(sess_line.label_text, "NY AM")
+                if not na(sess_line.line_id)
+                    line.delete(sess_line.line_id)
+                if not na(sess_line.label_id)
+                    label.delete(sess_line.label_id)
+                array.remove(session_lines, i)
+    // Add new NY AM lines starting from the bar where high/low was established
+    if i_show_sessions and not na(ny_am_high_bar) and not na(ny_am_low_bar)
+        extend_mode = i_extend_mitigated_lines ? extend.right : extend.none
+        
+        h_line = line.new(ny_am_high_bar, ny_am_high, bar_index + 1, ny_am_high, xloc=xloc.bar_index, extend=extend_mode, color=color.new(color.green, 30), style=line.style_solid, width=2)
+        h_label = label.new(ny_am_high_bar, ny_am_high, "NY AM H", xloc=xloc.bar_index, style=label.style_none, color=color.new(color.green, 30), textcolor=color.new(color.green, 30), size=size.tiny)
+        array.push(session_lines, SessionLine.new(ny_am_high_bar, ny_am_high, color.new(color.green, 30), "NY AM H", false, h_line, h_label))
+        
+        l_line = line.new(ny_am_low_bar, ny_am_low, bar_index + 1, ny_am_low, xloc=xloc.bar_index, extend=extend_mode, color=color.new(color.green, 30), style=line.style_solid, width=2)
+        l_label = label.new(ny_am_low_bar, ny_am_low, "NY AM L", xloc=xloc.bar_index, style=label.style_none, color=color.new(color.green, 30), textcolor=color.new(color.green, 30), size=size.tiny)
+        array.push(session_lines, SessionLine.new(ny_am_low_bar, ny_am_low, color.new(color.green, 30), "NY AM L", false, l_line, l_label))
+
+// Check NY AM mitigation
+if array.size(session_lines) > 0 and not na(ny_am_high) and not na(ny_am_low)
+    for i = array.size(session_lines) - 1 to 0
+        sess_line = array.get(session_lines, i)
+        if not sess_line.is_mitigated
+            if str.contains(sess_line.label_text, "NY AM H") and close > ny_am_high
+                sess_line.is_mitigated := true
+                array.set(session_lines, i, sess_line)
+                if not i_extend_mitigated_lines and not na(sess_line.line_id)
+                    line.set_extend(sess_line.line_id, extend.none)
+                    line.set_x2(sess_line.line_id, bar_index)
+            if str.contains(sess_line.label_text, "NY AM L") and close < ny_am_low
+                sess_line.is_mitigated := true
+                array.set(session_lines, i, sess_line)
+                if not i_extend_mitigated_lines and not na(sess_line.line_id)
+                    line.set_extend(sess_line.line_id, extend.none)
+                    line.set_x2(sess_line.line_id, bar_index)
+
+// NY PM lines: Draw when NY PM ends (16:00), showing NY PM range from 13:30-16:00
+if not in_ny_pm_session and in_ny_pm_session[1] and not na(ny_pm_high) and not na(ny_pm_start_bar)
+    if array.size(session_lines) > 0
+        for i = array.size(session_lines) - 1 to 0
+            sess_line = array.get(session_lines, i)
+            if str.contains(sess_line.label_text, "NY PM")
+                if not na(sess_line.line_id)
+                    line.delete(sess_line.line_id)
+                if not na(sess_line.label_id)
+                    label.delete(sess_line.label_id)
+                array.remove(session_lines, i)
+    // Add new NY PM lines starting from the bar where high/low was established
+    if i_show_sessions and not na(ny_pm_high_bar) and not na(ny_pm_low_bar)
+        extend_mode = i_extend_mitigated_lines ? extend.right : extend.none
+        
+        h_line = line.new(ny_pm_high_bar, ny_pm_high, bar_index + 1, ny_pm_high, xloc=xloc.bar_index, extend=extend_mode, color=color.new(color.blue, 30), style=line.style_solid, width=2)
+        h_label = label.new(ny_pm_high_bar, ny_pm_high, "NY PM H", xloc=xloc.bar_index, style=label.style_none, color=color.new(color.blue, 30), textcolor=color.new(color.blue, 30), size=size.tiny)
+        array.push(session_lines, SessionLine.new(ny_pm_high_bar, ny_pm_high, color.new(color.blue, 30), "NY PM H", false, h_line, h_label))
+        
+        l_line = line.new(ny_pm_low_bar, ny_pm_low, bar_index + 1, ny_pm_low, xloc=xloc.bar_index, extend=extend_mode, color=color.new(color.blue, 30), style=line.style_solid, width=2)
+        l_label = label.new(ny_pm_low_bar, ny_pm_low, "NY PM L", xloc=xloc.bar_index, style=label.style_none, color=color.new(color.blue, 30), textcolor=color.new(color.blue, 30), size=size.tiny)
+        array.push(session_lines, SessionLine.new(ny_pm_low_bar, ny_pm_low, color.new(color.blue, 30), "NY PM L", false, l_line, l_label))
+
+// Check NY PM mitigation
+if array.size(session_lines) > 0 and not na(ny_pm_high) and not na(ny_pm_low)
+    for i = array.size(session_lines) - 1 to 0
+        sess_line = array.get(session_lines, i)
+        if not sess_line.is_mitigated
+            if str.contains(sess_line.label_text, "NY PM H") and close > ny_pm_high
+                sess_line.is_mitigated := true
+                array.set(session_lines, i, sess_line)
+                if not i_extend_mitigated_lines and not na(sess_line.line_id)
+                    line.set_extend(sess_line.line_id, extend.none)
+                    line.set_x2(sess_line.line_id, bar_index)
+            if str.contains(sess_line.label_text, "NY PM L") and close < ny_pm_low
+                sess_line.is_mitigated := true
+                array.set(session_lines, i, sess_line)
+                if not i_extend_mitigated_lines and not na(sess_line.line_id)
+                    line.set_extend(sess_line.line_id, extend.none)
+                    line.set_x2(sess_line.line_id, bar_index)
+
+// Session lines now use extend=extend.right, no manual updates needed
+
+// Silver Bullet vertical lines (professional pattern - only on <= 15min timeframes)on <= 15min timeframes)
+show_sb_lines = timeframe.in_seconds() <= 900  // 15 minutes = 900 seconds
+
+var line london_sb_line = na
+var label london_sb_label = na
+var line nyam_sb_line = na
+var label nyam_sb_label = na
+var line nypm_sb_line = na
+var label nypm_sb_label = na
+var float london_sb_high = na
+var float london_sb_low = na
+var float nyam_sb_high = na
+var float nyam_sb_low = na
+var float nypm_sb_high = na
+var float nypm_sb_low = na
+
+if i_show_sessions and show_sb_lines and barstate.isconfirmed
+    // London SB start - create new line
+    if in_london_sb and not in_london_sb[1]
+        line.delete(london_sb_line)
+        label.delete(london_sb_label)
+        london_sb_high := high
+        london_sb_low := low
+        london_sb_line := line.new(bar_index, low, bar_index, high, xloc=xloc.bar_index, color=color.new(color.red, 50), style=line.style_dashed, width=1)
+        london_sb_label := label.new(bar_index, high, "LDN SB", xloc=xloc.bar_index, style=label.style_label_down, color=color.new(color.red, 70), textcolor=color.white, size=size.tiny)
+    
+    // NY AM SB start - create new line
+    if in_ny_am_sb and not in_ny_am_sb[1]
+        line.delete(nyam_sb_line)
+        label.delete(nyam_sb_label)
+        nyam_sb_high := high
+        nyam_sb_low := low
+        nyam_sb_line := line.new(bar_index, low, bar_index, high, xloc=xloc.bar_index, color=color.new(color.green, 50), style=line.style_dashed, width=1)
+        nyam_sb_label := label.new(bar_index, high, "NY AM SB", xloc=xloc.bar_index, style=label.style_label_down, color=color.new(color.green, 70), textcolor=color.white, size=size.tiny)
+    
+    // NY PM SB start - create new line
+    if in_ny_pm_sb and not in_ny_pm_sb[1]
+        line.delete(nypm_sb_line)
+        label.delete(nypm_sb_label)
+        nypm_sb_high := high
+        nypm_sb_low := low
+        nypm_sb_line := line.new(bar_index, low, bar_index, high, xloc=xloc.bar_index, color=color.new(color.blue, 50), style=line.style_dashed, width=1)
+        nypm_sb_label := label.new(bar_index, high, "NY PM SB", xloc=xloc.bar_index, style=label.style_label_down, color=color.new(color.blue, 70), textcolor=color.white, size=size.tiny)
+
+// Update SB vertical lines during their active windows (extend downward as price moves)
+if i_show_sessions and show_sb_lines
+    if in_london_sb and not na(london_sb_line)
+        london_sb_high := math.max(london_sb_high, high)
+        london_sb_low := math.min(london_sb_low, low)
+        line.set_y1(london_sb_line, london_sb_low)
+        line.set_y2(london_sb_line, london_sb_high)
+        if not na(london_sb_label)
+            label.set_y(london_sb_label, london_sb_high)
+    
+    if in_ny_am_sb and not na(nyam_sb_line)
+        nyam_sb_high := math.max(nyam_sb_high, high)
+        nyam_sb_low := math.min(nyam_sb_low, low)
+        line.set_y1(nyam_sb_line, nyam_sb_low)
+        line.set_y2(nyam_sb_line, nyam_sb_high)
+        if not na(nyam_sb_label)
+            label.set_y(nyam_sb_label, nyam_sb_high)
+    
+    if in_ny_pm_sb and not na(nypm_sb_line)
+        nypm_sb_high := math.max(nypm_sb_high, high)
+        nypm_sb_low := math.min(nypm_sb_low, low)
+        line.set_y1(nypm_sb_line, nypm_sb_low)
+        line.set_y2(nypm_sb_line, nypm_sb_high)
+        if not na(nypm_sb_label)
+            label.set_y(nypm_sb_label, nypm_sb_high)
+
+// MSS lines (orange horizontal line at MSS price) - professional pattern
+if i_show_sessions and barstate.isconfirmed
+    // Bullish MSS line - draw at the moment it happens with extend=extend.right
+    if mss_bullish
+        line.delete(mss_bull_line)
+        label.delete(mss_bull_label)
+        mss_bull_line := line.new(bar_index, close, bar_index + 1, close, xloc=xloc.bar_index, extend=extend.right, color=color.new(color.orange, 30), style=line.style_solid, width=2)
+        mss_bull_label := label.new(bar_index, close, "MSS ↑", xloc=xloc.bar_index, style=label.style_label_up, color=color.orange, textcolor=color.white, size=size.tiny)
+    
+    // Bearish MSS line - draw at the moment it happens with extend=extend.right
+    if mss_bearish
+        line.delete(mss_bear_line)
+        label.delete(mss_bear_label)
+        mss_bear_line := line.new(bar_index, close, bar_index + 1, close, xloc=xloc.bar_index, extend=extend.right, color=color.new(color.orange, 30), style=line.style_solid, width=2)
+        mss_bear_label := label.new(bar_index, close, "MSS ↓", xloc=xloc.bar_index, style=label.style_label_down, color=color.orange, textcolor=color.white, size=size.tiny)
+
+// FVG boxes are now drawn at formation (see above) and updated each bar
+
+// Liquidity levels (professional pattern with line.set_x2())
+if i_show_liquidity and barstate.isconfirmed
+    // BSL (Buy Side Liquidity) - draw when new level detected with extend=extend.right
+    if not na(bsl_level) and (na(bsl_line) or bsl_level != bsl_level[1])
+        line.delete(bsl_line)
+        label.delete(bsl_label)
+        bsl_line := line.new(bar_index - 20, bsl_level, bar_index + 1, bsl_level, xloc=xloc.bar_index, extend=extend.right, color=color.new(color.red, 30), style=line.style_dotted, width=1)
+        bsl_label := label.new(bar_index, bsl_level, "BSL", xloc=xloc.bar_index, style=label.style_label_down, color=color.red, textcolor=color.white, size=size.tiny)
+    
+    // SSL (Sell Side Liquidity) - draw when new level detected with extend=extend.right
+    if not na(ssl_level) and (na(ssl_line) or ssl_level != ssl_level[1])
+        line.delete(ssl_line)
+        label.delete(ssl_label)
+        ssl_line := line.new(bar_index - 20, ssl_level, bar_index + 1, ssl_level, xloc=xloc.bar_index, extend=extend.right, color=color.new(color.green, 30), style=line.style_dotted, width=1)
+        ssl_label := label.new(bar_index, ssl_level, "SSL", xloc=xloc.bar_index, style=label.style_label_up, color=color.green, textcolor=color.white, size=size.tiny)
+
+// Entry markers (only when trade executes)
+if i_show_labels
+    if long_setup and strategy.position_size > strategy.position_size[1]
+        label.new(bar_index, low, "LONG\nSB", style=label.style_label_up, color=color.new(color.green, 0), textcolor=color.white, size=size.normal)
+    
+    if short_setup and strategy.position_size < strategy.position_size[1]
+        label.new(bar_index, high, "SHORT\nSB", style=label.style_label_down, color=color.new(color.red, 0), textcolor=color.white, size=size.normal)
+
+// ========== DASHBOARD ==========
+var table dashboard = table.new(position.top_right, 2, 15, border_width=2, frame_color=color.gray, frame_width=1)
+
+if barstate.islast
+    // Header
+    table.cell(dashboard, 0, 0, "ICT Silver Bullet", bgcolor=color.new(color.blue, 80), text_color=color.white, text_size=size.normal)
+    table.cell(dashboard, 1, 0, syminfo.ticker, bgcolor=color.new(color.blue, 80), text_color=color.white, text_size=size.small)
+    
+    // Session (tracking period)
+    sess_color = color.new(color.gray, 70)
+    table.cell(dashboard, 0, 1, "Session", bgcolor=color.new(color.gray, 80), text_color=color.white, text_size=size.small)
+    table.cell(dashboard, 1, 1, current_session, bgcolor=sess_color, text_color=color.white, text_size=size.small)
+    
+    // Silver Bullet Window (entry period)
+    sb_window_color = in_sb_window ? color.new(color.green, 60) : color.new(color.gray, 80)
+    sb_status_text = in_sb_window ? "🎯 " + current_sb_status : "⏳ Waiting..."
+    table.cell(dashboard, 0, 2, "SB Window", bgcolor=color.new(color.gray, 80), text_color=color.white, text_size=size.small)
+    table.cell(dashboard, 1, 2, sb_status_text, bgcolor=sb_window_color, text_color=color.white, text_size=size.small)
+    
+    // Daily Bias
+    bias_text = daily_bias_bull ? "BULL" : daily_bias_bear ? "BEAR" : "NEUTRAL"
+    bias_color = daily_bias_bull ? color.new(color.green, 70) : color.new(color.red, 70)
+    table.cell(dashboard, 0, 3, "Daily Bias", bgcolor=color.new(color.gray, 80), text_color=color.white, text_size=size.small)
+    table.cell(dashboard, 1, 3, bias_text, bgcolor=bias_color, text_color=color.white, text_size=size.small)
+    
+    // HTF Bias Alignment (show if all timeframes aligned)
+    htf_text = htf_bias_aligned ? (htf_bias_bull ? "⭐ ALL BULL" : "⭐ ALL BEAR") : "Mixed"
+    htf_color = htf_bias_aligned ? (htf_bias_bull ? color.new(color.green, 50) : color.new(color.red, 50)) : color.new(color.gray, 80)
+    table.cell(dashboard, 0, 4, "HTF Aligned", bgcolor=color.new(color.gray, 80), text_color=color.white, text_size=size.small)
+    table.cell(dashboard, 1, 4, htf_text, bgcolor=htf_color, text_color=color.white, text_size=size.tiny)
+    
+    // Zone
+    zone_text = in_discount ? "Discount" : in_premium ? "Premium" : "Equilibrium"
+    zone_color = in_discount ? color.new(color.green, 80) : in_premium ? color.new(color.red, 80) : color.new(color.gray, 80)
+    table.cell(dashboard, 0, 5, "Zone", bgcolor=color.new(color.gray, 80), text_color=color.white, text_size=size.small)
+    table.cell(dashboard, 1, 5, zone_text, bgcolor=zone_color, text_color=color.white, text_size=size.small)
+    
+    // Session Ranges (показвам vilken session range som används)
+    session_range_text = not na(london_high) ? "London: " + str.tostring(london_high, format.mintick) + "-" + str.tostring(london_low, format.mintick) : not na(asia_high) ? "Asia: " + str.tostring(asia_high, format.mintick) + "-" + str.tostring(asia_low, format.mintick) : "Building..."
+    table.cell(dashboard, 0, 6, "Session Range", bgcolor=color.new(color.gray, 80), text_color=color.white, text_size=size.small)
+    table.cell(dashboard, 1, 6, session_range_text, bgcolor=color.new(color.gray, 90), text_color=color.white, text_size=size.tiny)
+    
+    // Liquidity Status (show sweep type for ICT clarity)
+    liq_text = "Waiting..."
+    if liquidity_swept_down
+        if ssl_swept_prev_session
+            liq_text := "SSL Swept ✓ (Prev)"
+        else if ssl_swept_current_session
+            liq_text := "SSL Swept ✓ (Intra)"
+        else
+            liq_text := "SSL Swept ✓"
+    else if liquidity_swept_up
+        if bsl_swept_prev_session
+            liq_text := "BSL Swept ✓ (Prev)"
+        else if bsl_swept_current_session
+            liq_text := "BSL Swept ✓ (Intra)"
+        else
+            liq_text := "BSL Swept ✓"
+    
+    liq_color = liquidity_swept_down or liquidity_swept_up ? color.new(color.yellow, 70) : color.new(color.gray, 80)
+    table.cell(dashboard, 0, 7, "Liquidity", bgcolor=color.new(color.gray, 80), text_color=color.white, text_size=size.small)
+    table.cell(dashboard, 1, 7, liq_text, bgcolor=liq_color, text_color=color.white, text_size=size.tiny)
+    
+    // FVG Status with quality indicator
+    fvg_count = array.size(active_fvgs)
+    fvg_quality = bar_type_valid and (bars_same_type_bull or bars_same_type_bear) ? "⭐" : ""
+    fvg_text = str.tostring(fvg_count) + " Active" + (fvg_quality != "" ? " " + fvg_quality : "")
+    fvg_cell_color = fvg_quality != "" ? color.new(color.green, 85) : color.new(color.gray, 90)
+    table.cell(dashboard, 0, 8, "FVGs", bgcolor=color.new(color.gray, 80), text_color=color.white, text_size=size.small)
+    table.cell(dashboard, 1, 8, fvg_text, bgcolor=fvg_cell_color, text_color=color.white, text_size=size.small)
+    
+    // Risk
+    risk_text = "$" + str.tostring(i_risk_dollars, "#") + " (" + str.tostring(i_rr_ratio, "#.#") + ":1)"
+    table.cell(dashboard, 0, 9, "Risk/Trade", bgcolor=color.new(color.gray, 80), text_color=color.white, text_size=size.small)
+    table.cell(dashboard, 1, 9, risk_text, bgcolor=color.new(color.gray, 90), text_color=color.white, text_size=size.small)
+    
+    // === SETUP CHECKLIST SECTION ===
+    table.cell(dashboard, 0, 10, "SETUP STATUS", bgcolor=color.new(color.orange, 70), text_color=color.white, text_size=size.small)
+    table.cell(dashboard, 1, 10, "", bgcolor=color.new(color.orange, 70))
+    
+    // HTF Bias Check (strongest filter)
+    htf_check_text = htf_bias_aligned ? "✓ HTF Aligned" : "✗ Mixed"
+    htf_check_color = htf_bias_aligned ? color.new(color.green, 70) : color.new(color.red, 80)
+    table.cell(dashboard, 0, 11, "HTF Bias", bgcolor=color.new(color.gray, 80), text_color=color.white, text_size=size.tiny)
+    table.cell(dashboard, 1, 11, htf_check_text, bgcolor=htf_check_color, text_color=color.white, text_size=size.tiny)
+    
+    // Liquidity Sweep Check
+    liq_check = liquidity_swept_up or liquidity_swept_down
+    liq_check_text = liq_check ? "✓ Swept" : "✗ Waiting"
+    liq_check_color = liq_check ? color.new(color.green, 70) : color.new(color.red, 80)
+    table.cell(dashboard, 0, 12, "Liq Sweep", bgcolor=color.new(color.gray, 80), text_color=color.white, text_size=size.tiny)
+    table.cell(dashboard, 1, 12, liq_check_text, bgcolor=liq_check_color, text_color=color.white, text_size=size.tiny)
+    
+    // MSS Check
+    mss_check = mss_bullish or mss_bearish
+    mss_check_text = mss_check ? "✓ MSS" : "✗ No MSS"
+    mss_check_color = mss_check ? color.new(color.green, 70) : color.new(color.red, 80)
+    table.cell(dashboard, 0, 13, "Structure Shift", bgcolor=color.new(color.gray, 80), text_color=color.white, text_size=size.tiny)
+    table.cell(dashboard, 1, 13, mss_check_text, bgcolor=mss_check_color, text_color=color.white, text_size=size.tiny)
+    
+    // FVG Check
+    fvg_check_text = entry_fvg_valid ? "✓ FVG Ready" : "✗ No FVG"
+    fvg_check_color = entry_fvg_valid ? color.new(color.green, 70) : color.new(color.red, 80)
+    table.cell(dashboard, 0, 14, "FVG", bgcolor=color.new(color.gray, 80), text_color=color.white, text_size=size.tiny)
+    table.cell(dashboard, 1, 14, fvg_check_text, bgcolor=fvg_check_color, text_color=color.white, text_size=size.tiny)
+
+// ========== PERFORMANCE METRICS ==========
+plot(strategy.equity, "Equity", color=color.blue, display=display.data_window)
+plot(array.size(active_fvgs), "Active FVGs", color=color.purple, display=display.data_window)
+plot(in_sb_window ? 1 : 0, "SB Window", color=color.yellow, display=display.data_window)
